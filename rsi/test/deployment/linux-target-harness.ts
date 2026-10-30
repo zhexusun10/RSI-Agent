@@ -292,7 +292,12 @@ export async function startTargetHarness(options: TargetHarnessOptions = {}): Pr
 		join(dataDir, "tools"),
 		join(dataDir, "workflows"),
 	]) {
-		await chmod(directory, 0o777);
+		try {
+			await chown(directory, 0, 0);
+		} catch {}
+		try {
+			await chmod(directory, 0o777);
+		} catch {}
 		await chown(directory, TARGET_WORKER_UID, TARGET_WORKER_GID);
 	}
 

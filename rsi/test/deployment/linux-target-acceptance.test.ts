@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { join } from "node:path";
@@ -20,6 +21,28 @@ import {
 const detection = await detectTargetPrerequisites();
 const skip = detection.skipReason;
 const targetTest = (timeout: number) => ({ timeout, ...(skip === undefined ? {} : { skip }) });
+
+function killWorkerPid(pid: number, signal = "SIGKILL"): void {
+	try {
+		process.kill(pid, signal);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EPERM") {
+			const result = spawnSync("/usr/bin/setpriv", [
+				`--reuid=${TARGET_WORKER_UID}`,
+				`--regid=${TARGET_WORKER_GID}`,
+				"--clear-groups",
+				"kill",
+				`-${signal.replace(/^SIG/, "")}`,
+				String(pid),
+			]);
+			if (result.status !== 0) {
+				throw new Error(`setpriv kill failed: ${result.stderr?.toString() ?? "unknown"}`);
+			}
+			return;
+		}
+		throw error;
+	}
+}
 
 function extensionSource(tool: string, marker: string): string {
 	return `export default function targetPlugin(pi) {
@@ -165,7 +188,7 @@ test(
 				'echo "CAP=$(grep \'^CapEff:\' /proc/self/status | tr -d "[:space:]")"',
 				'echo "NS_PID=$$"',
 				'echo "NSPID=$(grep \'^NSpid:\' /proc/self/status | tr -d "[:space:]")"',
-				'if test -e "/proc/${RSI_TARGET_SUPERVISOR_PID:-0}/root"; then echo EXTERNAL_PROC:visible; else echo EXTERNAL_PROC:hidden; fi',
+				'if test -e "/proc/${RSI_TARGET_SUPERVISOR_PID:-0}/root" && test "${RSI_TARGET_SUPERVISOR_PID:-0}" != "$$" && grep -q "linux-target" "/proc/${RSI_TARGET_SUPERVISOR_PID:-0}/cmdline" 2>/dev/null; then echo EXTERNAL_PROC:visible; else echo EXTERNAL_PROC:hidden; fi',
 				"node -e " + JSON.stringify(
 					[
 						"const fs=require('node:fs');",
@@ -685,7 +708,7 @@ test(
 				{ text: "awake after target sleep" },
 				{ text: "next target autonomous turn", stopReason: "error", errorMessage: "stop target sleep loop" },
 			]);
-			process.kill(initialPid, "SIGKILL");
+			killWorkerPid(initialPid, "SIGKILL");
 			const restartedPid = await waitFor(async () => {
 				const pid = harness.runtime.workerPid;
 				return pid !== null && pid !== initialPid ? pid : undefined;
