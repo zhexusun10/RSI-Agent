@@ -63,11 +63,11 @@ test(
 		await writeFile(script, "[]\n", { mode: 0o644 });
 		await writeFile(capture, "", { mode: 0o644 });
 		await chmod(capture, 0o666);
+		await chmod(plugins, 0o777);
+		await chmod(workspace, 0o777);
 		for (const dir of [workspace, plugins, piAgent, sessions, workerHome]) {
 			await chown(dir, WORKER_UID, WORKER_GID);
 		}
-		await chmod(plugins, 0o777);
-		await chmod(workspace, 0o777);
 		const config = parseRsiConfig({
 			version: 1,
 			timeZone: "UTC",
