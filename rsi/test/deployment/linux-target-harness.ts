@@ -1,4 +1,4 @@
-import { chmod, chown, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, chown, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -49,6 +49,35 @@ function strictFailure(message: string): never {
 		`Linux target acceptance prerequisites failed: ${message}. ` +
 			"This target check does not turn a missing Linux/namespace/Docker prerequisite into a skip.",
 	);
+}
+
+export async function forceRemove(targetPath: string): Promise<void> {
+	const makeWritable = async (current: string): Promise<void> => {
+		try {
+			await chown(current, 0, 0);
+		} catch {}
+		try {
+			await chmod(current, 0o777);
+		} catch {}
+		try {
+			const entries = await readdir(current, { withFileTypes: true });
+			for (const entry of entries) {
+				const child = join(current, entry.name);
+				if (entry.isDirectory()) {
+					await makeWritable(child);
+				} else {
+					try {
+						await chown(child, 0, 0);
+					} catch {}
+					try {
+						await chmod(child, 0o666);
+					} catch {}
+				}
+			}
+		} catch {}
+	};
+	await makeWritable(targetPath);
+	await rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
 }
 
 /**
@@ -355,8 +384,8 @@ export async function startTargetHarness(options: TargetHarnessOptions = {}): Pr
 		async cleanup() {
 			await harness.stop();
 			if (options.preserveOnCleanup === true) return;
-			await rm(root, { recursive: true, force: true });
-			await rm(stateDir, { recursive: true, force: true });
+			await forceRemove(root);
+			await forceRemove(stateDir);
 		},
 	};
 	try {

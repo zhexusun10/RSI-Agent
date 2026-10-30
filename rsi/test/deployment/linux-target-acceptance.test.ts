@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,6 +10,7 @@ import {
 	TARGET_WORKER_GID,
 	TARGET_WORKER_UID,
 	detectTargetPrerequisites,
+	forceRemove,
 	readJson,
 	runSandboxCommand,
 	startTargetHarness,
@@ -792,8 +793,8 @@ test(
 			if (second !== undefined) {
 				await second.cleanup();
 			} else {
-				await rm(first.root, { recursive: true, force: true });
-				await rm(first.stateDir, { recursive: true, force: true });
+				await forceRemove(first.root);
+				await forceRemove(first.stateDir);
 			}
 		}
 	},
