@@ -185,7 +185,7 @@ test(
 				'echo "UID=$(id -u)"',
 				'echo "GID=$(id -g)"',
 				'echo "GROUPS=$(id -G)"',
-				'echo "CAP=$(grep \'^CapEff:\' /proc/self/status | tr -d "[:space:]")"',
+				'echo "CAP:$(grep \'^CapEff:\' /proc/self/status | tr -d "[:space:]")"',
 				'echo "NS_PID=$$"',
 				'echo "NSPID=$(grep \'^NSpid:\' /proc/self/status | tr -d "[:space:]")"',
 				'if test -e "/proc/${RSI_TARGET_SUPERVISOR_PID:-0}/root" && test "${RSI_TARGET_SUPERVISOR_PID:-0}" != "$$" && grep -q "linux-target" "/proc/${RSI_TARGET_SUPERVISOR_PID:-0}/cmdline" 2>/dev/null; then echo EXTERNAL_PROC:visible; else echo EXTERNAL_PROC:hidden; fi',
@@ -261,7 +261,7 @@ test(
 			assert.match(text, /CMD_FAIL:mount_bind/);
 			assert.match(text, /NESTED_USERNS:denied/);
 			assert.match(text, /EXTERNAL_PROC:hidden/);
-			assert.match(text, /CAP:CapEff:0+$/m);
+			assert.match(text, /CAP[:=]CapEff:0+$/m);
 			assert.match(text, new RegExp(`UID=${TARGET_WORKER_UID}\\b`));
 			assert.match(text, new RegExp(`GID=${TARGET_WORKER_GID}\\b`));
 			assert.match(text, /NODE_FAIL:prompt/);
@@ -887,6 +887,7 @@ test(
 			assert.ok(requests >= 1, "the pinned web-search plugin must call the local mock HTTP endpoint");
 		} finally {
 			await harness.cleanup();
+			server.closeAllConnections?.();
 			await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
 		}
 	},

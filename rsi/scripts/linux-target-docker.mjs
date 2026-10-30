@@ -270,6 +270,8 @@ export function dockerRunArgs({
 		"SETGID",
 		"--cap-add",
 		"CHOWN",
+		"--cap-add",
+		"KILL",
 		"--security-opt",
 		`seccomp=${seccompPath}`,
 		"--security-opt",
