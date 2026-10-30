@@ -253,10 +253,17 @@ export async function startTargetHarness(options: TargetHarnessOptions = {}): Pr
 	await writeFile(scriptFile, "[]\n", { mode: 0o644 });
 	await writeFile(captureFile, "", { mode: 0o666 });
 	await chmod(captureFile, 0o666);
-	await chmod(pluginSourceDir, 0o777);
-	await chmod(workspace, 0o777);
 	await chmod(markdownsDir, 0o755);
-	for (const directory of [workspace, pluginSourceDir, piAgentDir, piSessionDir, workerHomeDir, join(dataDir, "tools"), join(dataDir, "workflows")]) {
+	for (const directory of [
+		workspace,
+		pluginSourceDir,
+		piAgentDir,
+		piSessionDir,
+		workerHomeDir,
+		join(dataDir, "tools"),
+		join(dataDir, "workflows"),
+	]) {
+		await chmod(directory, 0o777);
 		await chown(directory, TARGET_WORKER_UID, TARGET_WORKER_GID);
 	}
 

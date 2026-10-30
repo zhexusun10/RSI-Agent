@@ -63,9 +63,8 @@ test(
 		await writeFile(script, "[]\n", { mode: 0o644 });
 		await writeFile(capture, "", { mode: 0o644 });
 		await chmod(capture, 0o666);
-		await chmod(plugins, 0o777);
-		await chmod(workspace, 0o777);
 		for (const dir of [workspace, plugins, piAgent, sessions, workerHome]) {
+			await chmod(dir, 0o777);
 			await chown(dir, WORKER_UID, WORKER_GID);
 		}
 		const config = parseRsiConfig({
