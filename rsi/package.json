@@ -1,0 +1,46 @@
+{
+	"name": "rsi-agent",
+	"version": "0.1.0",
+	"private": true,
+	"description": "Out-of-process RSI runtime, Supervisor, sandboxed Pi Worker, and integration tests",
+	"type": "module",
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"main": "./src/shared/index.ts",
+	"types": "./src/shared/index.ts",
+	"exports": {
+		".": {
+			"types": "./src/shared/index.ts",
+			"import": "./src/shared/index.ts"
+		},
+		"./shared": {
+			"types": "./src/shared/index.ts",
+			"import": "./src/shared/index.ts"
+		}
+	},
+	"scripts": {
+		"check:types": "node scripts/check-types.mjs",
+		"test": "node scripts/test.mjs",
+		"check:plugins": "node scripts/check-plugins.mjs",
+		"check": "node scripts/check.mjs",
+		"start": "node src/main.ts",
+		"test:integration": "node --test test/integration/*.test.ts"
+	},
+	"dependencies": {
+		"@earendil-works/pi-agent-core": "1.4.0",
+		"@earendil-works/pi-ai": "1.4.0",
+		"@earendil-works/pi-coding-agent": "1.4.0",
+		"pi-better-web-search": "0.1.7",
+		"pi-continuity": "0.3.1",
+		"typebox": "1.3.27"
+	},
+	"devDependencies": {
+		"@types/node": "22.19.19",
+		"typescript": "5.9.3"
+	},
+	"bin": {
+		"rsi": "./bin/rsi.mjs",
+		"pi": "./bin/pi.mjs"
+	}
+}

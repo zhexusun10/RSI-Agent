@@ -1,0 +1,311 @@
+RSI PRODUCTION CONTAINER-ENTRYPOINT ACCEPTANCE
+
+Date: 2026-10-27
+Scope: rsi/scripts/linux-validation.mjs, new rsi/scripts/linux-entrypoint-smoke.mjs,
+rsi/test/deployment/production-entrypoint-*.{ts,mjs}, production-entrypoint fixtures,
+rsi/test/deployment/linux-target-config.test.ts, .github/workflows/rsi-linux.yml,
+rsi/reports/production-entrypoint.txt.
+
+No commit was created. No sandbox/preflight source, main.ts,
+deployment-preflight.mjs, business Runtime/provider/IPC/knowledge source,
+operator-config.ts, root Markdown, or pi/ content was modified. No production
+Agent prompt or real Memory was written. No real credential was read. No remote
+workflow, paid provider, host Docker/WSL service, or 24-hour soak was started.
+
+STATUS
+
+BLOCKED ON THE ACTUAL LINUX+DOCKER TARGET, NOT PASSED.
+
+This snapshot adds a real container-entrypoint smoke that uses the image's
+default ENTRYPOINT, container-entrypoint.sh, deployment-render-config.mjs,
+deployment-preflight.mjs, container-run.mjs, the production src/main.ts
+Supervisor, and the real bubblewrap Worker. It does not replace the Supervisor
+or entrypoint with a fixture.
+
+The smoke itself was not executed on a Linux host in this snapshot because the
+local host is Windows and has no Docker daemon, bwrap, or WSL runtime. Only
+command construction, syntax, static/config tests, and the local mock HTTP/SSE
+provider were exercised locally. This report does not claim CI, Docker, Linux
+namespace, or production entrypoint success.
+
+WHY THE OLD TARGET SUITE WAS INSUFFICIENT
+
+The existing strict target suite remains unchanged and still runs with
+`docker run --entrypoint node ...` over the target harness. It proves reload,
+LKG, Watchdog, sleep, sandbox, and target tests, but it bypasses:
+
+- container-entrypoint.sh and its root/process-initialization checks,
+- deployment-render-config.mjs,
+- deployment-preflight.mjs,
+- container-run.mjs and its TERM/process-group forwarding,
+- the image ENTRYPOINT/HEALTHCHECK/STOPSIGNAL contract.
+
+The new smoke is therefore a separate suite. The old suite was not relabeled as
+entrypoint evidence, and the new smoke does not bypass the entrypoint.
+
+NEW REAL-ENTRYPOINT FLOW
+
+1. Build or reuse the real image, then verify its bwrap version and
+   --disable-userns feature.
+2. Create unique, labeled Docker volumes and a unique bridge network for this
+   run only. No existing user volume is reused or deleted.
+3. Prepare only the test operator files on the fresh /data volume with a
+   short-lived no-network helper container:
+   - settings.json is the immutable image baseline settings plus
+     defaultProvider="rsi-entrypoint-mock" and
+     defaultModel="rsi-entrypoint-mock-model";
+   - models.json is a valid operator models.json pointing at the dedicated
+     local mock provider host/port;
+   - auth.json is `{}`. No real token or key is used.
+4. Start a fixture-only mock provider sidecar on the same dedicated network.
+   It implements the OpenAI-compatible streaming chat-completions/SSE format
+   consumed by the real Pi SDK. It records request tool names, system text, and
+   tool results under a test-only bind mount. It is not the test subject.
+5. Start the target container with no `--entrypoint` override. The image default
+   ENTRYPOINT runs the real container-entrypoint.sh. The fixture prompt is
+   bind-mounted read-only exactly at /run/config/system-prompt.txt.
+6. A driver runs via `docker exec` only to observe the running production
+   container. It does not start, replace, or wrap the Supervisor/Worker.
+7. The production Supervisor starts the real bwrap Worker. The operator-selected
+   model is resolved through the production worker-main.ts createProductionModel
+   path using /data/pi-agent/settings.json and models.json; RSI_PROVIDER and
+   RSI_MODEL are not used to inject the route.
+8. The local mock drives a bounded task through the real Worker:
+   - bash/read/write native tools,
+   - direct-write denial probes for operator config, prompt, and Memory,
+   - a brokered Memory write,
+   - a workspace task write,
+   - an index read for persisted read statistics,
+   - an explicit sleep with a persisted future deadline.
+9. The driver verifies fresh seed, index audit, file ownership/modes, plugin
+   discovery, baseline/LKG digest, Worker PID/health, Memory visibility in the
+   next provider request, read statistics, and sleeping health/deadline.
+10. The container is stopped normally with `docker stop --time 30`. The smoke
+    requires Docker State.Running=false, State.Pid=0, ExitCode=0, no OOM kill,
+    and no `sending SIGKILL`/grace-expiry message.
+11. A second container starts with the same /data and /state volumes. The driver
+    verifies the same explicit sleep deadline and ID, Memory, workspace task,
+    index read statistics, operator config, plugin generation, active digest,
+    and LKG digest/generation. It then uses the existing operator
+    container-control.mjs cancelSleep command and requires a new real Worker
+    provider request after the wake.
+12. Both containers are stopped normally again. Only the generated containers,
+    network, volumes, prompt fixture, and temp evidence dirs are removed. On
+    failure, redacted log tails, exit/state, error message, and stack are kept in
+    the report.
+
+FILES ADDED / CHANGED
+
+- rsi/scripts/linux-validation.mjs
+  Adds --suite target|entrypoint|all. Default remains target. The entrypoint
+  suite calls the new bounded smoke. Reports now include the suite, redacted
+  error stack, target results, and production-entrypoint results.
+
+- rsi/scripts/linux-entrypoint-smoke.mjs
+  Unique network/volumes/containers; fixture prompt mount at
+  /run/config/system-prompt.txt read-only; default image ENTRYPOINT for the
+  tested container; no --privileged, no docker.sock, no host-root mount; target
+  retains cap-drop ALL plus only SETUID/SETGID/CHOWN and the deployment seccomp
+  profile; helper sidecar/prepare containers use cap-drop ALL and no network
+  (prepare) or only the dedicated network (mock).
+
+- rsi/test/deployment/production-entrypoint-smoke.ts
+  In-container observation and assertions for prepare/first/restart phases.
+
+- rsi/test/deployment/production-entrypoint-mock-provider.mjs
+  Local OpenAI-compatible SSE fixture. It is scoped to the dedicated network and
+  a test-only bind mount.
+
+- rsi/test/deployment/fixtures/production-entrypoint/models.json and auth.json
+  Operator-style fixture model config with a fixture-only key literal and empty
+  auth. No production prompt or Memory fixture exists.
+
+- rsi/test/deployment/production-entrypoint.test.ts
+  Static wiring/security assertions plus a local real-Pi-SDK -> mock SSE test.
+
+- rsi/test/deployment/linux-target-config.test.ts
+  Updated CI timeout expectation and added entrypoint-suite/soak-label checks.
+
+- .github/workflows/rsi-linux.yml
+  Path filters now include .dockerignore and markdowns/**, in addition to rsi/**
+  and the workflow file. The bounded job (60-minute cap) first runs the new
+  production-entrypoint fixture/config tests, then the strict target suite, and
+  then the real entrypoint smoke. It never runs the 24-hour soak.
+
+- rsi/scripts/linux-smoke.mjs
+  Comment documents --suite target|entrypoint|all; still never invokes soak.
+
+- rsi/scripts/linux-soak.mjs
+  Soak evidence is now explicitly named "linux-target-harness-soak" with
+  productionEntrypoint=false. It still runs via docker --entrypoint node and
+  does not exercise container-entrypoint.sh.
+
+COVERAGE MAPPED TO THE REQUEST
+
+- Real production entrypoint / Supervisor / bwrap Worker:
+  target container has no --entrypoint override; node is started by
+  container-run.mjs after entrypoint config rendering and deployment preflight.
+- Fresh five-document seed and index audit:
+  exactly Memory.md, architecture.md, index.md, operations.md, security.md;
+  auditIndex consistent; root-owned 0644 files; no prompt/Memory written into
+  the image or seed fixture.
+- Operator settings/models/auth:
+  root-owned, Worker-GID-readable 0640; real Worker bash probes fail direct
+  writes but can read; production createProductionModel uses settings/models.
+- Baseline/digest persistence:
+  /state/plugins/state.json active and LKG generation/digest checked before and
+  after the same-volume container restart.
+- Two pinned npm plugins:
+  existing install-plugins.mjs --verify-only uses the real Pi discovery against
+  the actual seeded /data/pi-agent and requires exactly two extensions; the
+  mock request capture also records exposed tool names.
+- Baseline/deployment preflight success:
+  entrypoint logs must contain the unified `[rsi-preflight] full sandbox preflight
+  passed` line with host/namespace uid/gid, CapEff=0, cleared supplementary
+  groups, namespace/mount verification, and both protected sysctls; the
+  Supervisor handoff line is also required. A failed preflight fails the smoke.
+  The old `[rsi-preflight] bwrap namespace probe passed` line is no longer
+  emitted after the preflight-parity merge.
+- Worker ready and real health:
+  /state/runtime/health.json healthy/sleeping state with live Worker PID plus
+  the image Docker HEALTHCHECK observed by docker inspect.
+- Bounded task/tool/Memory:
+  real Worker bash/read/write calls; Memory write becomes visible to the next
+  real Pi SDK provider request without a Worker restart.
+- Normal stop/TERM:
+  docker stop exit code 0, stopped container, no OOM kill, no forced tree
+  SIGKILL log.
+- Reuse-volume restart:
+  same Memory, workspace task, read statistics, sleep ID/deadline, active/LKG
+  digest, known generation, and operator config; operator cancelSleep triggers
+  the next real provider request.
+- Bounded CI:
+  the job remains non-privileged and time-bounded; it does not use host Docker
+  socket, host root, extra Worker capabilities, a whole-disk read-only mount, or
+  an unsandboxed fallback.
+- Fail closed:
+  linux-validation still fails on missing Linux/Docker/userns/bwrap rather than
+  skipping green. Ordinary cross-platform tests skip only the target-only cases.
+
+COMMANDS ACTUALLY RUN IN THIS SNAPSHOT AND RESULTS
+
+1) `cd rsi && npm run check:types`
+   EXIT 0.
+
+2) Syntax checks:
+   `node --check rsi/scripts/linux-target-docker.mjs`
+   `node --check rsi/scripts/linux-validation.mjs`
+   `node --check rsi/scripts/linux-smoke.mjs`
+   `node --check rsi/scripts/linux-soak.mjs`
+   `node --check rsi/scripts/linux-entrypoint-smoke.mjs`
+   `node --check rsi/test/deployment/production-entrypoint-mock-provider.mjs`
+   EXIT 0 for all. This proves syntax only.
+
+3) `cd rsi && node --test --test-concurrency=1 test/deployment/production-entrypoint.test.ts`
+   3 tests, 3 pass, 0 fail, 0 skip. Includes a real SettingsManager +
+   ModelRuntime + operator-style models.json -> local HTTP/SSE fixture request
+   and verifies the Pi SDK parsed the tool-call stream without a real key.
+
+4) `cd rsi && node --test --test-concurrency=1 test/deployment/*.test.ts`
+   25 tests, 16 pass, 0 fail, 9 skip. The 9 skips are the unchanged strict Linux
+   target scenarios on win32.
+
+5) `cd rsi && npm run check`
+   97 test files; tests 316, pass 299, fail 0, skipped 17, EXIT 0; final output
+   "rsi checks passed." The 17 skips are Linux/bwrap target conditions, not
+   production-entrypoint evidence.
+
+6) Workflow YAML parse with the repository's `yaml` dependency:
+   EXIT 0; the workflow has the expected job and steps. Parsing YAML is not CI
+   execution.
+
+7) `cd rsi && node scripts/linux-validation.mjs --mode docker --suite target --no-build --timeout-ms 60000 --report .artifacts/production-entrypoint-target-blocked.json`
+   EXIT 1: "Linux target validation requires a Linux host; current platform is
+   win32." Report contains the redacted error and stack.
+
+8) `cd rsi && node scripts/linux-validation.mjs --mode docker --suite entrypoint --no-build --timeout-ms 60000 --report .artifacts/production-entrypoint-entrypoint-blocked.json`
+   EXIT 1: same platform prerequisite failure. This is the correct fail-closed
+   result, not a pass and not a skip.
+
+9) `cd rsi && RSI_TARGET_STRICT=1 node --test --test-concurrency=1 test/deployment/linux-target-acceptance.test.ts`
+   EXIT 1: strict prerequisites failed on win32; tests 1, pass 0, fail 1,
+   skipped 0.
+
+10) Host prerequisite inspection:
+    `bwrap --version` -> EXIT 127, command not found.
+    `docker info --format '{{json .ServerVersion}}'` -> EXIT 1, cannot connect
+    to npipe:////./pipe/docker_engine.
+    `wsl -l -v` -> EXIT 127, Wsl/0x80070422.
+    No Docker/WSL service was enabled or started.
+
+ACTUAL TARGET PREMISES STILL REQUIRED
+
+The entrypoint smoke can only pass on a Linux host with:
+
+1. A working Docker daemon and permission to build/run containers.
+2. Kernel unprivileged user namespaces; fs.protected_hardlinks=1 and
+   fs.protected_symlinks=1 on the host.
+3. Docker custom seccomp support and the deployment seccomp profile accepted by
+   the installed Docker/libseccomp.
+4. AppArmor (if present) allowing the bwrap user/PID/IPC/UTS/mount namespace
+   probe.
+5. bubblewrap with --disable-userns, non-setuid, plus setpriv/newuidmap in the
+   image as already checked at image build.
+6. Node 22.19 execution and the pinned local image contents.
+
+Still not executed in this snapshot:
+
+- Docker build and the real ENTRYPOINT container.
+- Real bwrap mount/UID/PID namespace, seccomp/AppArmor, and operator ro-bind.
+- Real Docker HEALTHCHECK, normal container stop/TERM, and volume restart.
+- The local mock HTTP/SSE path from inside the actual container.
+- GitHub Actions or any remote workflow.
+- The optional 24-hour soak.
+
+24-HOUR SOAK STATUS
+
+The 24-hour soak is NOT a production-entrypoint soak. `linux-soak.mjs` still
+starts `linux-soak-runner.ts` through `docker run --entrypoint node`, bypassing
+container-entrypoint.sh. It is now explicitly reported as
+`linux-target-harness-soak` with `productionEntrypoint: false`. It was not run in
+this snapshot, and this report makes no 24-hour stability claim.
+
+REMAINING LIMITATIONS / RISKS
+
+- The new smoke is code/static/fixture-tested on Windows only; its actual Docker
+  and Linux target result is blocked.
+- The mock provider is a local fixture, not a real external provider. This is
+  intentional: it exercises the real Pi SDK API/streaming path with no real key
+  and no paid service, but it does not prove any real provider's behavior.
+- The operator route is fixture models.json/settings.json; the container and
+  Worker path are production code.
+- CI YAML presence and local YAML parsing are not CI execution evidence.
+- The strict target harness remains `--entrypoint node` by design; only the new
+  suite claims entrypoint coverage.
+
+MERGE UPDATE (2026-10-28, preflight-parity + production-entrypoint)
+
+- The two branches are now wired together. `linux-entrypoint-smoke.mjs` no
+  longer expects the pre-parity `bwrap namespace probe passed` text; it parses
+  the unified `[rsi-preflight] full sandbox preflight passed` line and requires
+  host_uid/host_gid, namespace_uid/namespace_gid, CapEff=0,
+  supplementary_groups=cleared, namespace=verified, mount=verified,
+  protected_hardlinks=true, protected_symlinks=true on both first start and
+  same-volume restart.
+- The in-container driver now also verifies the rendered config (Worker uid/gid,
+  bwrap path, workspace/state/markdowns/prompt paths, UTC, unrestricted
+  network), the runtime GID, and the runtime supplementary groups. The tested
+  container still uses the image default ENTRYPOINT; only helper/mock/prepare
+  containers use `--entrypoint node`.
+- CI has an explicit root-Markdown seed/inventory step
+  (`test/repository-docs.test.ts` plus `review2-markdown-seed.test.ts`) and keeps the `.dockerignore`,
+  `markdowns/**`, and `rsi/**` path filters. Missing seed files, an inconsistent
+  index, or a missing entrypoint/preflight assertion fail the job.
+- Current local result after the merge: `npm run check` -> 330 tests, 312 pass,
+  0 fail, 18 skip, EXIT 0 (`rsi checks passed.`), 98 test files. The focused
+  preflight/deployment/entrypoint suite -> 29 tests, 28 pass, 0 fail, 1 Linux
+  skip. The target/entrypoint Docker suites remain blocked_environment on this
+  Windows host: `linux-validation --suite all` exits 1 with "requires a Linux
+  host; current platform is win32"; the strict target run exits 1, not skip.
+- No Linux/Docker/entrypoint target result is claimed by this addendum. The
+  24-hour soak remains unrun and must be executed explicitly on a target host.

@@ -1,0 +1,78 @@
+RSI 四工作流整合修复报告（preflight / provider / IPC / Linux-validation）
+
+日期：2026-10-27
+范围：把继承的四个修复/目标验收工作流接入同一 rsi 实现，修复交叉接线缺陷，补跨模块回归；未修改 pi/，未创建 commit，未写 Agent 提示词/人格，未放宽沙箱，未禁网，未把整个磁盘改只读，未删除或跳过失败回归。
+宿主：Windows MINGW64_NT-10.0-26300，Node v24.16.0，npm 11.13.0；真实 Linux/bwrap/Docker 仍不可用。
+
+一、结论
+
+本机完整套件已通过：311 tests，294 pass，0 fail，17 skip；`npm run check` EXIT 0，最终 “rsi checks passed.”。四个工作流不再各自“helper 正确但系统不能启动”：首次 baseline、合法新 tool reload、3 健康轮 LKG 晋升、延迟 crash 回滚和重启后恢复均在同一真实 Runtime/Worker 链路中通过。
+
+这不是生产最终通过。17 个 skip 全部是 Linux/bwrap/Docker 目标条件；strict Linux runner 在 win32 上明确 EXIT 1。旧 integration 报告的 257 tests 全绿早于新增失败回归，不能冒充当前结论；旧 final-audit 继续维持历史“不通过”，最终结论只由下游独立审查更新。
+
+二、四个工作流实际接线
+
+1. Preflight
+- 首次 baseline 与所有 Supervisor/Worker reload 都走外部 static + Mock preflight，不在 Supervisor 导入候选代码。
+- 生产请求使用 `process.execPath` 和 `args=[entry]`；cwd 在 protected/hidden root 之外的 staging 目录；candidate/result/stderr 路径映射到 sandbox 视图。
+- 诊断文件 no-follow/单硬链接/dev-ino 复核；超时杀完整候选进程树并返回诊断。
+- 保留 `preflight-child-executable.test.ts` 并通过；新增/保留 `preflight-launch-contract.test.ts`、`preflight-stderr-alias.test.ts`、`runtime-reload-preflight-start.test.ts`。
+
+2. Provider / model
+- 候选加载前安装 ModelRuntime guard；loader 返回后、bindCore flush 前检查 pending provider/native/virtual 注册。
+- initial bind、reload beforeSessionStart、session_start、replaceSession/recovery 都安装 provider API guard；拒绝错误结构化可见，route/baseUrl/api 不变。
+- 保留 `reload-provider-api-guard.test.ts` 原 3 个回归并通过；`reload-provider-boundary.test.ts` 覆盖 computed/保留引用、tool/command、startup/reload/replaceSession。
+
+3. Reload rejection / candidate cleanup
+- loader 已切换或新 runtime 已建立后的失败先恢复 previous approved set；恢复失败才退出交 Watchdog。
+- `reload-rejection-loaded-state.test.ts`、`runtime-reload-rejection-cleanup.test.ts` 通过：被拒绝候选的 tool/MCP/context hook 不残留、不可调用。
+
+4. IPC / Watchdog / sleep
+- Worker 启动经 stdin 接收一次性 token；首帧认证绑定 launchId/generation/session；第二 peer/重放/旧代际事件拒绝。
+- Watchdog 用 Supervisor 启动 handle 的宿主 bwrap PID 做 exit/kill/monitor；namespace PID 只记 `reportedWorkerPid`；旧宿主 PID 进 retired 集，迟到 exit 不冒充当前 Worker。
+- Worker 启动读取持久化 sleep 状态，sleep 中重启上报 sleeping 并保留 deadline。
+- 修复 coordinator 队列与 Watchdog 队列的锁反转：reload observer 的 begin/complete/fail 按顺序异步入 Watchdog 队列，不在 coordinator 持锁时 await Watchdog；`watchdog-restart-readiness.test.ts` 通过。
+
+三、其余接线修复
+
+- before_agent_start 候选不能再改 systemPromptOptions/forceSystemPrompt/getSystemPromptOptions；人工 prompt + Memory 外的 system 注入被清除或拒绝。
+- top-level/nested tool result 先清精确 Runtime metadata 行，再追加权威 Memory/index/time；details/usage/structuredContent/isError 保留。
+- native read/write/edit 对 workspace symlink/junction 做 canonicalize；指向 markdowns 的 alias 走 broker 并计数，nested alias 拒绝。
+- Supervisor runtime.log 对 worker.exception/reload 诊断统一凭据脱敏。
+- 新增 `test/integration/runtime-baseline-reload-promote-crash.test.ts`：外部 baseline gen1 → 合法 new-tool reload gen2 → 工具调用 → 3 健康轮晋升 gen2 LKG → 延迟 crash 候选 → Watchdog 回滚/重启 → active/lkg 仍 gen2，crash 文件消失，safe tool 可用，恢复通知可见。
+- P1-5：`src/shared/operator-config.ts` 对 `/data/pi-agent` 的 settings/models/auth 建持久化 digest 基线；每次 launch（含 Watchdog restart）校验，Agent 改写、symlink/hardlink 或非 regular 文件 fail closed。launcher 对三个文件加只读 bind；Docker entrypoint 将文件设为 root:WorkerGID 0640。合法 operator 变更须停机更新并删除 `/state/runtime/operator-pi-config.json` 基线。`review2-operator-config.test.ts` 覆盖改写后 crash restart 被拒并进入 unrecoverable；同时修复 unrecoverable 回调中 `writeHealth()` 反向 await Watchdog 队列的死锁。
+- P1-8：`.dockerignore` 不再排除根 `markdowns/`；Dockerfile 复制到 `/opt/rsi/seed-markdowns/` 并 root-owned 只读；`scripts/seed-markdowns.mjs` 在 fresh volume/旧两行 index 上 seed 五篇并保持 index 一致，自定义 index 不覆盖。`review2-markdown-seed.test.ts` 覆盖 fresh、legacy upgrade、custom index 三种路径。
+
+四、执行与结果
+
+1) `cd rsi && npm run check:types` -> EXIT 0。
+2) `cd rsi && npm run check:plugins` -> EXIT 0；实际加载 pi-continuity 0.3.1 与 pi-better-web-search 0.1.5。
+3) 原失败回归 + 新跨模块测试 -> tests 6, pass 6, fail 0, skipped 0。
+4) 部署静态/配置测试 -> tests 13, pass 13, fail 0, skipped 0。
+4b) review2 + P1-5/P1-8 -> tests 12, pass 12, fail 0, skipped 0。
+5) Linux 目标测试在 win32 -> tests 9, skipped 9（不是通过）。
+6) 完整串行套件 -> tests 311, pass 294, fail 0, skipped 17, EXIT 0。
+7) `npm run check` -> EXIT 0；“rsi checks passed.”。测试脚本固定 `--test-concurrency=1`，消除并行 CPU 竞争导致的 3 秒 Mock 假超时；产品 3 秒期限未放宽。
+8) `node scripts/linux-validation.mjs --mode docker --no-build --timeout-ms 60000 ...` -> EXIT 1，明确 “requires a Linux host; current platform is win32”。
+9) `bwrap --version` 不存在；`docker info` daemon 不可用；WSL 0x80070422。
+
+五、Windows local launcher 与生产 bwrap 的明确差异
+
+本机功能测试使用 LocalProcessGroupLauncher / LocalWorkerSandboxLauncher，它们只验证 argv/env/路径/生命周期契约。以下均未在真实 bwrap 证明：
+- FD 继承/关闭、/proc/self/fd 与 fd 别名；
+- PID namespace 中 Worker PID 与宿主 bwrap PID 的对应；
+- mount namespace、ro-bind、/proc、/dev、tmpfs、path alias 与 rename；
+- 独立 Worker UID/GID、setpriv/newuidmap、supplementary groups、CapEff=0；
+- Docker seccomp/AppArmor、volume 权限/恢复、healthcheck、TERM/KILL 和 24H soak。
+
+因此报告不把 local launcher、YAML、compose config 或 skip 当作 Linux 安全通过。
+
+六、剩余 blocker
+
+1. 真实 Linux root + bwrap 目标套件未执行；9 个目标用例 skip。
+2. Docker build/up、seccomp/AppArmor、setpriv/newuidmap、卷恢复、容器 TERM、24H soak 未执行。
+3. 真实 provider/OAuth/MCP/web_search 未执行；无付费 API。
+4. GitHub Actions workflow 未运行。
+5. 未 commit；`git diff -- pi` 为 0。
+
+最终判定：本机四工作流整合回归通过；生产独立验收仍未通过，等待真实 Linux/Docker 目标执行与下游独立审查。

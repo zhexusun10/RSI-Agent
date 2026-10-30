@@ -1,0 +1,289 @@
+HISTORICAL REPORT: Agent Pi commands and reload claims are superseded; see markdowns/architecture.md.
+
+INTEGRATION UPDATE: the external Supervisor now supplies RuntimeControlPort, worker IPC
+transport, docs.readView, agent_settled/exception events, and production sleep/reload wiring.
+See rsi/reports/integration.txt for current results and remaining limits.
+
+RSI-AGENT LOOP / SLEEP / CONTROL HANDOFF (plain text, not a prompt)
+Generated: 2026-10-26
+Scope: rsi/src/loop/**, rsi/src/control/**, rsi/bin/pi.mjs,
+       rsi/test/loop/**, rsi/test/control/**, rsi/reports/loop-control.txt
+No file under pi/, no shared/public contract file, and no package file was modified.
+No Agent persona or system prompt was written. No commit was created.
+
+STATUS
+- Implemented the external autonomous loop, persistent explicit-sleep scheduler,
+  per-provider-request sleep gate, Supervisor command controller, Worker reload gate,
+  control socket, structured Pi command tool, and read-only pi CLI shim.
+- The Supervisor side does not import or load Pi plugins. Plugin reload remains in the
+  Worker/Preflight modules and is reached only through the public reload ports.
+- All state is under the external protected state directory. No loop or control state
+  is written into workspace, markdowns, rsi source, or a Pi session file.
+- Sleep is not /quit and does not delete or modify Memory.md, index.md, or documents.
+
+IMPLEMENTED FILES
+- rsi/src/loop/state.ts
+  AtomicLoopStateStore, strict LoopState parser, revision, sleep ledger, continuation
+  ledger, wake notification fields. Rejects symlink, hardlink, non-file, partial JSON,
+  unknown fields, invalid deadlines, and oversized files.
+- rsi/src/loop/timer.ts
+  NodeLoopTimer, MAX_TIMER_DELAY_MS=2147483647, scheduleAtDeadline, scheduleAfterDelay.
+  Long deadlines are re-chunked and the wall clock is checked again after every chunk.
+- rsi/src/loop/sleep.ts
+  SleepScheduler (SleepGatePort + ModelRequestGatePort), createSleepTool, exact two-field
+  TypeBox schema, strict input/deadline prevalidation, createPiPrepareRequestGate.
+- rsi/src/loop/autonomous-loop.ts
+  AutonomousLoop (AutonomousLoopPort), agent_settled handling, continuation idempotency,
+  technical backoff, sleep/operator-input/session/reload handling, heartbeatState().
+- rsi/src/control/types.ts, protocol.ts
+  Finite control envelope, request/response validation, token compare, stack-bearing errors.
+- rsi/src/control/command-policy.ts
+  Structured Pi argv classification, forbidden slash/RPC aliases, package/MCP forwarding
+  policy, unsupported-headless classification, no substring scanning of shell text.
+- rsi/src/control/reload.ts
+  ReloadCoordinator (preflight -> approved generation -> apply), Worker IPC adapter,
+  createGuardedReloadAction for the Pi extension commandContextActions.reload binding.
+- rsi/src/control/command-controller.ts
+  Trusted Supervisor dispatch for the shared reload / shutdown / cancelSleep union only.
+- rsi/src/control/server.ts, client.ts
+  LF-NDJSON control listener/client, request-id idempotency, token/generation/session
+  validation, reload-only Worker surface, frame limit, no file-write or shell operation.
+- rsi/src/control/pi-command.ts
+  Structured pi_command Agent tool: /reload through the external gate, normal CLI through
+  an injected forwarder, forbidden/unsupported operations as stack-bearing tool errors.
+- rsi/src/control/pi-shim.ts and rsi/bin/pi.mjs
+  Read-only CLI shim. /reload reaches the external control socket; forbidden controls are
+  rejected; all other invocations are exec-forwarded to the real Pi CLI with unchanged
+  cwd, argv, environment, and inherited stdio.
+- rsi/test/loop/*.ts and rsi/test/control/*.ts
+  Fake clock, fake timers, fake Worker, fake Watchdog, temporary external state, and a
+  fake real-Pi executable. No real model is called.
+
+PUBLIC PORT CALL ORDER
+1. Explicit sleep request:
+   sleep tool input exact-one validation -> computeValidatedSleepDeadline (Clock + zone,
+   civil-date validation, 24:00:00 normalization, past/overflow checks) ->
+   AtomicLoopStateStore transact(active sleep, generationAtRequest, wakeId, notified=null)
+   -> arm chunked timer -> emit sleep.requested, sleep.entered, loop.paused ->
+   SleepScheduler onSleepEntered -> AutonomousLoop.pauseForSleep -> SleepGrant returned.
+2. Sleep deadline:
+   timer fire -> wakeDueOnce transact(status=completed, wakeNotifiedAtMs=now) -> clear timer
+   -> emit sleep.woke, loop.resumed -> resolve gate waiters -> SleepScheduler onWake ->
+   AutonomousLoop.handleSleepWake. A restart sees the same persisted deadline; a future
+   deadline is re-armed at the original instant, a due deadline is notified once.
+3. Every model/provider request:
+   Worker calls SleepGatePort.beforeModelRequest (or installs
+   createPiPrepareRequestGate as Pi's prepareRequest hook) -> read external ledger ->
+   active future sleep: await async waiter, no polling/blocking loop -> deadline wake ->
+   re-read ledger -> allowed only if no active sleep -> stopped runtime rejects the request.
+   Native tool follow-up, plugin continuation, queued message, and restart recovery must all
+   pass this same hook.
+4. agent_settled:
+   ignore agent_end -> reject duplicate runId in memory and against persisted
+   lastSettledRunId -> generation/session match -> if sleep active, no Supervisor turn ->
+   if aborted/queued/operator input pending, no Supervisor turn -> network/provider error
+   gets bounded exponential backoff -> otherwise persist one pending continuation ->
+   zero-delay timer -> dispatch -> worker.startRuntimeTurn(continuationId, factual Runtime
+   message) -> persist accepted/runId. A second settle or pending continuation cannot create
+   a parallel prompt.
+5. Reload:
+   /reload tool or shim or trusted command -> validate request id/reason/candidateId/
+   generation/session -> ReloadCoordinator lock (same request id joins, different id is
+   rejected retryably) -> preflight -> require report.ok -> require runtime generation
+   unchanged -> approve report.generation -> emit reload.preflight/reload.started ->
+   apply. Worker apply calls reload.started, then raw Pi reload; failure calls reload.failed
+   and returns the original stack to the caller.
+6. CLI shim:
+   classify argv -> /reload: control request -> response/detail or stack on stderr and
+   exit 1 -> forbidden/invalid/unsupported: explicit stderr and exit 2 -> forward: spawn
+   real Pi with the original cwd/argv/stdio and SHIM_MARKER_ENV=1.
+
+SLEEP TOOL CONTRACT
+- Tool name: sleep.
+- Schema properties: exactly duration and until; both optional; additionalProperties=false.
+- Runtime requires exactly one present non-undefined field.
+- duration: ^([1-9][0-9]{0,14})([smh])$; positive integer only; zero, signs, fractions,
+  leading zero, unknown units, unsafe products, and non-representable Date/epoch values fail.
+- until: exact YYYY/MM/DD HH:mm:ss. Years 0001..9999, real calendar days, minute/second
+  00..59. 24:00:00 is accepted only with 00 minutes and 00 seconds and becomes the next
+  civil day 00:00:00; 24:00:01, 24:01:00, and 0000/00/00 fail. Invalid dates are rejected
+  before JS Date can roll them (for example 2026/02/30 24:00:00 is rejected).
+- Absolute times use the configured IANA zone; default is UTC. Skipped local times fail,
+  ambiguous local times choose the earlier instant (shared time contract).
+- Errors return isError tool results containing message and stack, not stderr-only logs.
+
+EXTERNAL STATE FILE FORMAT
+Path: RuntimePaths.sleepStateFile (default <state>/sleep.json).
+This file is the loop/sleep ledger, not a bare shared SleepState object. Consumers must use
+SleepScheduler.status()/LoopStateStore.read(), not assume the outer shape is SleepState.
+Example shape:
+{
+  "version": 1,
+  "revision": 0,
+  "generation": null,
+  "sessionId": null,
+  "sleep": {
+    "version": 1,
+    "sleepId": "sleep-<uuid>",
+    "source": "explicit-sleep-tool",
+    "request": {
+      "kind": "relative",
+      "duration": { "raw": "5m", "amount": 5, "unit": "m" }
+    },
+    "requestedAtMs": 0,
+    "deadlineMs": 300000,
+    "timeZone": "UTC",
+    "status": "active",
+    "updatedAtMs": 0,
+    "generationAtRequest": 1,
+    "wakeId": "runtime-wake:sleep-<uuid>",
+    "wakeNotifiedAtMs": null
+  },
+  "continuation": {
+    "id": "continuation-<uuid>",
+    "kind": "runtime-wake",
+    "createdAtMs": 0,
+    "status": "pending",
+    "sourceRunId": null,
+    "dispatchedAtMs": null,
+    "acceptedRunId": null,
+    "error": null
+  },
+  "pendingOperatorInputs": 0,
+  "stoppedReason": null,
+  "lastSettledRunId": null,
+  "lastError": null,
+  "updatedAtMs": 0
+}
+- Absolute request form is { kind: "absolute", until: "...", normalizedUntil: "..." }.
+- sleep.status: active | completed | cancelled. completed/cancelled keeps the record for
+  restart idempotency; a new sleep request replaces it.
+- wakeNotifiedAtMs is the exactly-once wake marker. wakeId is stable for the sleep record.
+- continuation.status: pending | dispatching | accepted | failed | skipped. A persisted
+  pending/dispatching continuation is re-dispatched with the same id after restart; Worker
+  must dedupe startRuntimeTurn by continuationId.
+- revision increases on every persisted mutation; updatedAtMs is the external Clock.
+- Writes use same-directory temp file, mode 0600, fsync, rename over target, directory fsync
+  where supported, Windows EPERM/EBUSY/EACCES rename retry, and cleanup of the temp file.
+- State directory creation is mode 0700. Reads reject symlink/hardlink/non-file/oversize.
+
+CLI PATH LAYOUT AND ENVIRONMENT
+Recommended production layout:
+  <shim-dir>/pi              -> rsi/bin/pi.mjs (symlink or wrapper), read-only source path
+  PATH                       = <shim-dir>:<real-pi-bin>:...
+  RSI_PI_REAL_CLI            = /absolute/path/to/real/installed/pi  (recommended explicit)
+  RSI_CONTROL_SOCKET         = <state>/run/control.sock (Unix) or a Windows named pipe
+  RSI_CONTROL_TOKEN          = optional protected token from human config/environment
+  RSI_SESSION_GENERATION     = current external Worker generation (non-negative integer)
+  RSI_SESSION_ID             = current Pi session id
+  RSI_CONTROL_TIMEOUT_MS     = optional positive request timeout
+- The shim must be earlier in PATH than the real Pi executable. If RSI_PI_REAL_CLI is absent,
+  PATH lookup skips the shim's own realpath to avoid recursion.
+- /reload is intercepted. install/remove/update/list and native mcp CLI invocations are
+  forwarded unchanged. -p/ordinary Pi invocations are forwarded unchanged. Model/thinking/
+  prompt/session/credential flags and control aliases are rejected.
+- The control token is never written to the ledger, workspace, or source. A Unix socket
+  should additionally be protected by state-directory permissions and Worker uid policy.
+
+REQUIRED FINAL WIRING (integration, not done in this module)
+1. Supervisor:
+   const clock = SystemClock;
+   const store = new AtomicLoopStateStore({ filePath: paths.sleepStateFile,
+                                           stateDir: paths.stateDir, clock });
+   const timers = new NodeLoopTimer();
+   const scheduler = new SleepScheduler({ clock, timeZone: config.timeZone, store, timers,
+       events, generation: () => workerGeneration, sessionId: () => workerSessionId,
+       onSleepEntered: s => loop.pauseForSleep(s),
+       onWake: n => loop.handleSleepWake({ sleep: n.sleep, reason: n.reason }) });
+   const loop = new AutonomousLoop({ clock, timeZone: config.timeZone, store, timers,
+       worker: loopWorkerAdapter, sleep: scheduler, sleepScheduler: scheduler,
+       baseBackoffMs, maxBackoffMs, onError });
+   await loop.start() only after the Worker is ready; on container TERM call loop.stop()
+   once, then Worker stop, then Watchdog stop. Never let a signal handler auto-restart.
+2. Worker:
+   - Install createPiPrepareRequestGate(scheduler, () => ({ generation, sessionId })) as the
+     Pi prepareRequest hook so every provider request is gated.
+   - Subscribe to agent_settled (final) for loop continuation. Do not use agent_end.
+   - Route run_started (runtime/sleep/operator), session_changed, reload_started, and
+     reload_completed into AutonomousLoop.handleWorkerEvent. Call loop.noteOperatorInput
+     before normal human input delivery; operator input is not a sleep cancellation.
+   - Implement startRuntimeTurn by appending a factual Runtime state message/event with the
+     supplied continuationId. Dedupe that id, reject a new prompt while a run is active
+     (accepted=false, queued=true), and never start a parallel run. Report the stable runId.
+   - Register createSleepTool(scheduler, clock) and createPiCommandTool({ reload, forward }).
+     Keep Worker tool-result time/index/memory decoration in the Worker.
+   - heartbeat state should use loop.heartbeatState(): sleeping is a live state, not a missed
+     heartbeat. Do not generate or suppress Watchdog leases from the loop.
+3. Reload bindings:
+   const reload = createWorkerReloadCoordinator({ clock, ipc, reload: () => session.reload(),
+       currentGeneration: () => generation, events });
+   const guardedActions = { ...extensionCommandActions,
+       reload: createGuardedReloadAction(reload, { currentGeneration, currentSessionId }) };
+   await session.bindExtensions({ ...spec, commandContextActions: guardedActions });
+   Do not pass the raw session.reload callback to bindExtensions. Agent /reload uses the same
+   coordinator. Supervisor reload uses ReloadCoordinator + PreflightPort + its apply adapter;
+   only CommandController (source=supervisor) can dispatch reload/shutdown/cancelSleep.
+4. Control socket:
+   Create ControlServer with endpoint below paths.stateDir, token from protected human config,
+   currentGeneration/currentSessionId providers, and the Worker reload coordinator or an
+   equivalent Supervisor-approved adapter. Close it on runtime stop. Do not expose shutdown,
+   cancelSleep, model, thinking, session switching, file writes, or shell execution on the
+   Worker/CLI control listener.
+5. Watchdog:
+   Keep heartbeat/process lease handling independent of whether the model is streaming.
+   While SleepScheduler has an active deadline, Worker heartbeat state is "sleeping"; the
+   process and IPC must continue. The Watchdog must not interpret explicit sleep as a hang.
+6. State ownership:
+   No other module should write paths.sleepStateFile directly. All sleep/continuation
+   mutations must go through AtomicLoopStateStore so revision/atomicity is preserved.
+
+OPERATOR INPUT POLICY
+- Only a successful, persisted sleep enters sleeping state. Agent termination text alone
+  never pauses and never creates sleep.
+- Human input is delivered through the normal Worker input path. noteOperatorInput records it
+  as pending and suppresses an extra Supervisor wake; sleep does not cancel or shorten.
+  After the deadline, queued input/continuation is processed under the same model gate.
+- A sleeping runtime is not a stopped runtime. Operator shutdown/TERM is the only normal
+  stop; it persists stoppedReason, cancels scheduled continuations, aborts the active run,
+  clears timers, and does not self-restart in the same process.
+
+TESTS EXECUTED (host Windows/MINGW, Node 24.16.0, fake clock/Worker/Watchdog, no model)
+- npm run check: success. 18 test files, 84 tests, 84 pass.
+- New coverage:
+  * agent_end does not wake; agent_settled appends one continuation; duplicate settle ignored.
+  * queued work/operator abort no Supervisor turn; network error bounded backoff.
+  * sleep suppresses settled continuation; wake starts one sleep turn; native continuation
+    inside an active run resumes without a second runtime turn.
+  * operator input during/after sleep does not cancel deadline or duplicate wake.
+  * session switch/reload stale events ignored; one post-change turn.
+  * operator stop clears timers, aborts, and never self-restarts in-process.
+  * sleep tool schema exactly duration/until; invalid forms, overflow, calendar/day errors;
+    24:00:00 normalization and 24:01/24:00:01 rejection.
+  * long sleep uses MAX_TIMER_DELAY_MS chunks and never an immediate overflow wake.
+  * restart future deadline re-arms original instant; due deadline wakes once; repeat restart
+    does not duplicate sleep wake.
+  * model-request gate resolves all native follow-ups only at deadline, wake event once.
+  * atomic state file parse/format checks and SleepScheduler cancellation.
+  * forbidden /quit, /model, /thinking, shutdown/RPC aliases; ordinary shell text mentioning
+    those words is forwarded, not misclassified.
+  * install/mcp/native CLI forwarding preserves cwd/argv/stdio; /reload reaches control socket;
+    failure returns PREFLIGHT_FAILED plus stack.
+  * reload preflight before apply; preflight failure no apply; generation-change fail closed;
+    concurrent reload same-id joins/different-id rejected; Worker adapter call order and
+    reload.failed on raw reload error; guarded ctx.reload cannot bypass preflight.
+  * reload during active sleep leaves deadline/gate intact and does not wake early.
+  * control server token/generation/session/source/request-id validation and idempotency.
+- npm run check:plugins still loads the two pinned extensions; no real model call was made.
+
+PENDING LINUX/INTEGRATION VERIFICATION
+1. Unix socket ownership/permissions and Worker-uid peer checks in bwrap; Windows named-pipe
+   tests are only the local equivalent.
+2. Real Pi prepareRequest hook binding, native tool auto follow-up, plugin continuation,
+   queued message, and session replacement against Pi 1.4.0.
+3. bindExtensions with the guarded commandContextActions.reload; prove extension ctx.reload
+   cannot reach raw session.reload.
+4. Container TERM ordering (loop stop, Worker abort, watchdog stop), 24-hour soak, clock jumps,
+   DST gaps/overlaps in configured zones, and very long deadline persistence across restarts.
+5. Watchdog integration with real heartbeat/lease timing while sleeping and while model
+   output is silent for reasons other than sleep.
+6. Supervisor apply adapter for the approved reload generation and LKG/health wiring.

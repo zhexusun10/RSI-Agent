@@ -1,0 +1,27 @@
+{
+	"version": 1,
+	"timeZone": "UTC",
+	"paths": {
+		"workspaceDir": "/data/workspace",
+		"dataDir": "/data",
+		"stateDir": "/state",
+		"piSourceDir": "/opt/rsi/node_modules/@earendil-works/pi-coding-agent",
+		"rsiSourceDir": "/opt/rsi",
+		"systemPromptFile": "/run/config/system-prompt.txt",
+		"markdownsDir": "/data/markdowns",
+		"pluginSourceDir": "/data/plugins"
+	},
+	"ipc": {
+		"maxFrameBytes": 1048576,
+		"requestTimeoutMs": 15000,
+		"heartbeatIntervalMs": 10000,
+		"heartbeatTimeoutMs": 30000,
+		"preflightTimeoutMs": 15000
+	},
+	"sandbox": {
+		"bwrapPath": "/usr/bin/bwrap",
+		"network": "unrestricted",
+		"workerUid": 10002,
+		"workerGid": 10002
+	}
+}

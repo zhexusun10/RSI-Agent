@@ -1,0 +1,237 @@
+INTEGRATION UPDATE: rsi/src/main.ts now constructs the bwrap launcher and Supervisor runtime; the production Worker is launched through it. Real Linux/Docker execution remains unverified on the Windows authoring host. See rsi/reports/integration.txt.
+
+RSI-AGENT SANDBOX / BUBBLEWRAP HANDOFF (plain technical report, not a prompt)
+Generated: 2026-10-27
+Scope: rsi/src/sandbox/**, rsi/test/sandbox/**, this report only.
+No Pi source, shared contracts, package files, Docker files, or prompts were modified.
+
+STATUS
+- Implemented the public bubblewrap launcher, validated mount/policy planner, fail-closed
+  runtime preflight, Worker environment builder, and process-control port.
+- The trusted Supervisor builds every argv element itself. No shell is used for launch,
+  paths or environment values.
+- Worker, preflight child, and their descendants use the same launcher/boundary (the request
+  carries purpose=worker|preflight|child; no weaker preflight path exists).
+- Base root "/" is bind-mounted writable. This is intentionally NOT a workspace-only sandbox
+  and NOT a whole-filesystem read-only sandbox. Network is not unshared.
+- Verified snapshots can be exposed with pluginCandidateMount(); the candidate backing path
+  must already be hidden or protected, otherwise planning fails closed. Plugin editing can be
+  added as an explicit rw mount.
+- No Agent prompt was written. No commit was created.
+
+PUBLIC API (rsi/src/sandbox/index.ts)
+- BubblewrapSandboxLauncher: implements shared SandboxLauncher.
+  - launch(request, signal?) -> SandboxProcessHandle
+  - preflight(request) -> BubblewrapPreflightReport
+- createBubblewrapLauncher(options)
+- createBubblewrapLauncherForConfig(config, verifiedLayout, overrides?) ->
+  { launcher, policy }
+- SandboxProcessControlPort / SandboxProcessHandle:
+  pid, processGroupId, exited, wait(), terminate(), killNow(), signalTree(),
+  descendants(), output().
+- SandboxExit: exitCode, signal, timedOut, aborted, terminated, startedAtMs,
+  exitedAtMs, durationMs, error.
+- SandboxOutputSnapshot: bounded stdout/stderr text, raw byte counts, truncation flags.
+- BubblewrapLauncherOptions: workerUid/Gid, optional setpriv helper, home/tmp/TZ,
+  explicit environment, additional/required protected and hidden paths, extra rw/ro
+  mounts, sensitive socket masks, output/timeout/termination limits.
+- createSandboxPlan(), buildBubblewrapArgv(), buildBubblewrapProbeArgv(),
+  inspectBubblewrapRuntime(), assertPreflightOk(), formatPreflightReport().
+- Path helpers: normalizeSandboxPath(), isPosixWithin(), parseMountInfo(),
+  findMountAliasTargets(), overlap assertions, minimalRoots().
+- Process helpers: collectProcessTree(), terminateProcessTree(),
+  signalProcessIdentities(), readProcessStat().
+- Mount helpers: SANDBOX_PLUGIN_ROOT="/run/rsi-plugins",
+  sandboxPluginCandidatePath(generation), pluginCandidateMount(source, generation).
+
+BWRAP ARGV / MOUNT ORDER (security-relevant)
+1. --die-with-parent --new-session
+2. --unshare-user --disable-userns --uid <worker> --gid <worker>
+3. --unshare-pid --unshare-ipc --unshare-uts [--unshare-cgroup-try]
+4. --hostname rsi-worker --cap-drop ALL --clearenv + explicit --setenv pairs
+5. --chdir <validated cwd>
+6. --bind / /                  (broad writable container/VM disk)
+7. --proc /proc                (dedicated proc; external PIDs and /proc/PID/root invisible)
+8. --dev /dev                  (minimal bwrap devices, not host /dev)
+9. --tmpfs /sys --tmpfs /dev/shm
+10. writable workspace / Pi home/session / worker home / plugin-editing mounts
+11. read-only run socket directory + candidate snapshot mounts
+12. read-only canonical protected roots and every discovered protected bind alias
+13. sensitive socket masks (/dev/null over known Docker/containerd/podman/buildkit sockets)
+14. hidden control-state tmpfs/file masks
+15. executable + argv (no shell string, no unquoted concatenation)
+- No --unshare-net / --share-net / network allowlist is emitted.
+- --cap-drop ALL plus no capability additions. bwrap also sets PR_SET_NO_NEW_PRIVS.
+- --disable-userns is required; setuid bwrap is rejected. Nested user namespaces therefore
+  cannot be used to gain CAP_SYS_ADMIN and remount the protected mounts.
+- Network namespace of the sandbox is the container namespace.
+- The recursive root bind means protected paths are overlaid read-only after all writable
+  binds, so mount order cannot let a broad writable bind win. Mountpoints make protected
+  renames/unlinks fail with EBUSY even when a parent is writable.
+- A dedicated /proc plus PID namespace prevents signals to the Supervisor and prevents
+  /proc/<supervisor-pid>/root access.
+
+PATH / ALIAS VALIDATION (fail closed)
+- Every protected/hidden/mount source is realpath-canonicalized and final symlinks are
+  rejected for mount roots. Executables may be symlinks and are resolved to a canonical file.
+- Absolute POSIX paths only; "..", NUL, relative paths and root as a protected/hidden root are
+  rejected.
+- Protected roots may not be Worker-owned, world-writable, or Worker-GID writable. Parent
+  chains may not be Worker-owned and may not be world/Worker-GID writable unless sticky.
+- Protected files require nlink=1. Required runtime paths must be covered by a protected
+  canonical root or alias.
+- /proc/self/mountinfo is parsed (including octal escapes). Bind mounts of a protected tree at
+  another path, nested mounts below protected paths, and hidden-state alias mounts are ro/hidden
+  too. Tmpfs/procfs mounts at unrelated mountpoints do not invent bogus aliases.
+- Writable sources/targets may not overlap protected paths or hidden state. Extra read-only
+  sources must be protected or hidden unless mounted in place, so a writable snapshot backing
+  path cannot remain reachable.
+- Worker cwd, HOME, TMPDIR, executable and every mounted source are checked for Worker
+  readability/execute where required. This catches a root-only state/snapshot parent and gives
+  an actionable error before bwrap starts.
+- Hidden roots are reduced to minimal roots; state tmpfs is applied after candidate/run mounts
+  so the original backing path is hidden while the read-only target remains visible.
+- Mount target directories/files below root-owned locations (for example /run/rsi* ) are
+  created by the trusted Supervisor before spawn, because bwrap itself runs as the Worker UID.
+
+IDENTITY / CREDENTIALS (IMPORTANT DEPLOYMENT REQUIREMENT)
+- A distinct Worker host UID is required. A single-UID unprivileged user namespace is NOT
+  accepted: both UIDs would still be the same host uid for hardlink/ownership checks.
+- The implementation therefore requires the Supervisor to start as root (inside a constrained
+  container) and start bwrap under the Worker host UID:
+  * preferred: util-linux setpriv --reuid <uid> --regid <gid> --clear-groups -- bwrap ...
+  * fallback: spawn(uid,gid), but the runtime probe must prove supplementary groups were
+    cleared; otherwise launch fails closed.
+- The preflight also requires fs.protected_hardlinks=1, a non-setuid bwrap, a real
+  user/PID/IPC/UTS/mount namespace probe, --disable-userns, and a successful writable-root
+  bind. Failures are SANDBOX_INVALID with actionable checks; there is no unsandboxed fallback.
+- If the product must keep a non-root Supervisor, integration needs a trusted uid-switch helper
+  or a newuidmap/subuid-based user-namespace mapping. Neither is silently approximated.
+
+IPC / FDS / OUTPUT / LIFECYCLE
+- IPC is the shared LF-NDJSON Unix socket. The host run directory is mounted read-only at
+  /run/rsi; the Worker path must resolve to /run/rsi/worker.sock. The plan verifies this exact
+  mapping. stdout/stderr are logs only and are not protocol.
+- spawn() supplies only stdin=ignore, stdout/stderr pipes, no arbitrary host fd, no Docker
+  socket, no host device fd. Worker uses the mounted Unix socket, not an inherited protocol fd.
+- stdout/stderr are continuously drained into byte-limited collectors. Total bytes and
+  truncation are reported; backpressure cannot deadlock the Supervisor.
+- Termination is idempotent: TERM to the process group plus all collected descendants, grace
+  period, then KILL to remembered identities/group. Descendants reparented after bwrap exits are
+  still killed from the remembered host-PID/start-time list.
+- AbortSignal and timeout both use TERM then KILL. process "exit" hook sync-kills active
+  sandboxes; --die-with-parent also cleans up if the Supervisor is killed.
+- wait() resolves after stdio close with exit code, bwrap signal, timeout/abort/termination flags,
+  duration and spawn error. bwrap encodes a Worker self-signal as exit status 128+signal; the
+  handle reports bwrap's actual exit signal separately.
+- The Watchdog should retain SandboxProcessHandle and call terminate() to kill a hung top-level
+  loop and all descendants.
+
+MEMORY / PLUGINS / SNAPSHOTS
+- markdowns/ is a read-only directory bind in the sandbox, not a single-file bind. Broker
+  atomic rename of Memory.md is therefore visible immediately in the same running sandbox,
+  while direct bash/Node/extension writes fail. This is exercised by the Linux test.
+- state/, snapshots, control, logs, plugin state, sleep/Watchdog state and LKG backing are
+  masked with tmpfs. Read-only candidate snapshots are mounted from hidden/protected sources at
+  /run/rsi-plugins/g<generation>; do not bind an individual file/inode.
+- Plugin editing is an explicit rw mount. The loaded candidate target stays ro. Integration must
+  rewrite the Pi extension path to the sandbox candidate path; the shared WorkerLaunchSpec has no
+  sandbox path field at present.
+- Non-standard plugin/snapshot locations must be supplied as additional hidden/protected paths;
+  the planner rejects an extra read-only source whose writable backing would remain visible.
+
+TESTS AUTHORED
+- rsi/test/sandbox/argv.test.ts: pure argv/mount-order/capability/environment tests; asserts no
+  network unshare, broad root rw, no whole-root ro, protected-after-writable ordering, hidden
+  state last, capability drop, sensitive-socket masks, probe shape, argv element integrity.
+- rsi/test/sandbox/path-safety.test.ts: mountinfo parsing/escapes, protected/hidden bind aliases,
+  tmpfs alias false positives, overlap rejection, minimal roots, absolute path rejection.
+- rsi/test/sandbox/preflight.test.ts: environment injection filtering, distinct/non-root UID,
+  missing bwrap, non-Linux fail-closed, no unsafe fallback, report formatting.
+- rsi/test/sandbox/linux-bwrap.integration.test.ts (real Linux bwrap required):
+  1) bash writes to Pi/RSI/prompt/Memory/candidate fail; symlink, /proc/self/root, /proc/1/root,
+     read-only fd, /proc/self/fd, rename/delete protected root+parent, mount --bind and nested
+     userns fail; plugin editing/workspace//tmp writes succeed; CapEff=0; network ns unchanged.
+  2) Node fs direct writes fail for the same protected trees; plugin edit/workspace succeed.
+  3) broker atomic Memory replacement is observed by the already-running sandbox.
+  4) Supervisor remains alive while terminate() kills an ignored-TERM process tree.
+  5) timeout and AbortSignal use TERM then KILL and clean descendants.
+  6) exit code 42 is attributed; stdout/stderr limits/byte counts/truncation are correct.
+- The integration test skips with a printed reason (not pass) on: non-Linux, non-root Supervisor,
+  missing bwrap/setpriv-group prerequisites, missing --disable-userns, protected_hardlinks != 1,
+  or any real namespace/mount probe failure. Node test output distinguishes "skipped" from pass.
+
+EXECUTED ON THIS HOST
+- Host: Windows MINGW64, Node 24.16.0. No Linux bwrap execution was possible here; there is no
+  WSL distro and the Docker daemon was not running. The six real-OS tests were reported SKIPPED
+  with reason "requires Linux; current platform is win32", NOT passed.
+- rsi dependencies installed with: npm ci --ignore-scripts --no-audit --no-fund (122 packages,
+  no package/lock edits).
+- npm run check:types: PASS.
+- npm test: 67 tests, 61 pass, 6 skipped, 0 fail (last run after the sandbox changes).
+- npm run check: PASS, including the two pinned Pi extension load smoke test.
+- Therefore: argv/path/capability/env/preflight/no-fallback behavior is tested in this
+  environment. Kernel-enforced read-only mounts, rename/delete/proc/fd/symlink denial, network
+  namespace preservation, broker visibility, full process-tree kill, and capability drop are
+  authored but awaiting real Linux/Docker execution.
+
+DOCKER / DEPLOYMENT REQUIREMENTS (for integration)
+- Linux kernel with user, mount, PID, IPC and UTS namespaces, procfs, tmpfs. Non-setuid
+  bubblewrap supporting --disable-userns, --die-with-parent, --new-session, --cap-drop,
+  --proc, --dev, --tmpfs, --clearenv, --unshare-cgroup-try.
+- fs.protected_hardlinks=1 on the host/container kernel.
+- Supervisor runs as root inside a constrained container so it can use setpriv (recommended) or
+  spawn(uid,gid) to start bwrap as the dedicated Worker host UID. The Worker UID must not be 0.
+- Container seccomp/AppArmor must allow bwrap setup (clone/unshare/mount/pivot_root/umount,
+  setgroups/setgid/setuid for setpriv, prctl). On Ubuntu, allow unprivileged user namespaces for
+  bwrap (kernel.apparmor_restrict_unprivileged_userns) and check
+  /proc/sys/kernel/unprivileged_userns_clone. A custom seccomp profile is preferred to
+  seccomp=unconfined; Docker's default profile may block namespace setup. The Worker never gets
+  CAP_SYS_ADMIN; only the short-lived bwrap setup process uses namespace privileges.
+- Do not run with --privileged for the Worker, do not mount host /, host /dev, host PID namespace,
+  or the Docker/containerd socket into the sandbox root. The container root is the broad disk;
+  if the container itself exposes host paths/devices, bubblewrap cannot undo that.
+- Standard Docker/containerd/podman/buildkit sockets are masked by default. Non-standard sockets
+  must be added through sensitivePaths; otherwise the broad container disk may expose them.
+- Writable workspace/data/worker-home/Pi session/plugin-editing directories must be owned or
+  writable by the Worker UID. Protected source/prompt/markdown roots must be owned by the
+  Supervisor/root, not Worker-owned, not world-writable, and readable by the Worker.
+- If runDir or candidate snapshots are below hidden state, keep parent directories traversable
+  by the Worker (for example 0711) while file contents stay protected; set the IPC socket mode so
+  only the Worker can connect. Snapshot files should be nlink=1, read-only, and canonical.
+- The launcher does not implement cgroup CPU/memory/PID limits or a seccomp BPF profile; add
+  those outside this module if required. Network remains unrestricted by design.
+
+INTEGRATION INTERFACE REQUESTS (shared/Docker owners, not changed here)
+1. WorkerLaunchSpec/sandbox policy should eventually carry or expose workerUid/Gid, worker home,
+   timezone and candidate sandbox path explicitly; current helper derives them from RsiConfig and
+   options.
+2. Integration must translate a candidate snapshot to pluginCandidateMount(candidate.path,
+   generation) and pass the sandbox path /run/rsi-plugins/g<gen> to Pi. Do not bind a single
+   Memory.md or snapshot file.
+3. Preflight runner must call the same BubblewrapSandboxLauncher (purpose=preflight) with the
+   candidate mounted read-only, and must never import/execute candidate code in the Supervisor.
+4. Watchdog integration should retain SandboxProcessHandle and call terminate(); it should use
+   wait() exit/signal/timedOut/aborted fields for attribution.
+5. If a non-root Supervisor must be supported, shared deployment needs a trusted uid-switch
+   helper or subuid/newuidmap mapping. Current production behavior correctly fails closed.
+6. Add Pi installed dependency roots and outer runtime/daemon source roots to
+   additionalProtectedPaths/requiredProtectedPaths if they are not already inside piSourceDir,
+   rsiSourceDir or the verified protected paths.
+
+KNOWN LIMITS / NON-CLAIMS
+- No seccomp syscall filter is installed. Escape prevention relies on --disable-userns,
+  no capabilities, non-root Worker UID, namespaces and bwrap. A tested seccomp profile would be
+  additional defense in depth.
+- Pre-existing hardlinks inside a protected directory are not recursively enumerated. Root
+  files are checked for nlink=1, and fs.protected_hardlinks + distinct host UID prevent creating
+  new links; deployment must keep protected trees hardlink-clean.
+- Existing bind aliases are discovered from the Supervisor mountinfo only. Mounts created later
+  by another host process/namespace are outside the model; the Worker cannot create them
+  (no CAP_SYS_ADMIN, nested userns disabled).
+- Standard sensitive socket paths are masked; arbitrary Unix sockets/devices present in the
+  container root remain the deployment's responsibility.
+- Protected source integrity is enforced; confidentiality is not promised (Pi/RSI source is
+  readable by the Worker as needed to run Pi).
+- The broad container disk remains writable by design, including creating ordinary *.md outside
+  markdowns. No disk allowlist or post-hoc watcher is used as enforcement.

@@ -1,0 +1,387 @@
+RSI LINUX/DOCKER TARGET VALIDATION HANDOFF
+
+Date: 2026-10-27
+Scope: root .github/workflows/rsi-linux.yml, rsi/Dockerfile, rsi/compose.yaml,
+rsi/deploy/**, deployment prerequisite scripts, new Linux validation/soak scripts,
+rsi/test/deployment/**, rsi/reports/linux-validation.txt.
+No commit was created. No business src, package.json, shared source, other branch
+regression test, Markdown document, production Agent prompt, or Memory content was
+created or modified. pi/.github was not touched.
+
+STATUS
+
+NOT PASSED AS A LINUX/DOCKER ACCEPTANCE YET.
+
+This snapshot added executable target validation and a bounded CI smoke, but the
+actual Linux+Docker target run and the optional 24-hour soak remain PENDING:
+
+- Current execution host: MINGW64_NT-10.0-26300 (Windows), Node v24.16.0.
+- bwrap: command not found, exit 127. No local Linux runtime.
+- Docker daemon: unavailable. `docker info --format '{{json .ServerVersion}}'`
+  exited 1 with "failed to connect to the docker API at
+  npipe:////./pipe/docker_engine".
+- WSL was previously unavailable in this snapshot.
+- The target acceptance suite therefore reports 9 Windows skips when run by the
+  normal unit-test runner. The real target runner sets RSI_TARGET_STRICT=1 and
+  turns every missing Linux/userns/bwrap/Docker prerequisite into a failure, not
+  a skip or green light.
+- CI YAML existing in the tree does not mean CI ran. No GitHub Actions result is
+  claimed.
+- No real provider key, OAuth login, paid API call, MCP endpoint, or external
+  web search was used.
+
+COMMANDS ACTUALLY RUN IN THIS SNAPSHOT AND RESULTS
+
+1) Read the existing audit and deployment handoff:
+   rsi/reports/final-audit.txt
+   rsi/reports/deployment.txt
+
+2) cd rsi && npm run check:types
+   EXIT 0. TypeScript checked the new target harness, target suite, soak runner,
+   deployment unit tests, and existing sources without errors.
+
+3) cd rsi && node --test --test-concurrency=1 \
+      test/deployment/deployment.test.ts \
+      test/deployment/linux-target-config.test.ts
+   EXIT 0. 13 tests passed, including:
+   - Dockerfile uses node:22.19.0-trixie-slim and verifies --disable-userns.
+   - Dockerfile verifies the Node 22.19 TypeScript entry with
+     `node /opt/rsi/src/main.ts --help`.
+   - Validation/soak scripts pass `node --check`.
+   - Docker run flags retain cap-drop ALL, only SETUID/SETGID/CHOWN added,
+     deployment seccomp, read-only prompt/test mounts, no privileged mode and no
+     docker.sock.
+   - Push CI runs only the bounded validation, not the 24-hour soak.
+   - Target suite contains the requested real-bwrap acceptance scenarios.
+
+4) cd rsi && node --test --test-concurrency=1 \
+      test/deployment/linux-target-acceptance.test.ts
+   EXIT 0 with 9 explicit skips on win32:
+   "requires Linux; current platform is win32".
+   This is unit-discovery behavior only. `rsi/scripts/linux-validation.mjs`
+   uses RSI_TARGET_STRICT=1 and fails closed when the target prerequisites are
+   absent.
+
+5) node --check rsi/scripts/linux-target-docker.mjs
+   node --check rsi/scripts/linux-validation.mjs
+   node --check rsi/scripts/linux-smoke.mjs
+   node --check rsi/scripts/linux-soak.mjs
+   EXIT 0 for all.
+
+6) bwrap --version
+   EXIT 127: command not found.
+
+7) docker info --format '{{json .ServerVersion}}'
+   EXIT 1: npipe:////./pipe/docker_engine is unavailable.
+
+BWRAP VERSION / --disable-userns VERIFICATION
+
+The source requirement is inspectBubblewrapRuntime() in
+rsi/src/sandbox/preflight.ts: bwrap must be non-setuid, expose
+--disable-userns, pass a real user/PID/IPC/UTS/mount namespace probe as the
+distinct Worker UID, have no supplementary groups, and report CapEff=0. The
+deployment preflight was updated to call that same inspector instead of using a
+weaker shell probe.
+
+Version facts checked against upstream/package data during this change:
+
+- Docker Hub tag node:22.19.0-trixie-slim exists (observed last_updated
+  2025-09-09 in the Docker Hub API).
+- Debian bookworm has bubblewrap 0.8.0-2+deb12u1.
+- Upstream bubblewrap v0.8.0 bwrap.xml contains --disable-userns. So the option
+  is present in the bookworm package, but the task requirement was not to assume
+  that by repository name.
+- Debian trixie has bubblewrap 0.12.0-1~deb13u1. Inspecting the published
+  trixie amd64 .deb in this snapshot showed /usr/bin/bwrap mode 0755 (not
+  setuid) and package sysctl advice to enable kernel.unprivileged_userns_clone.
+- Upstream 0.12.0 includes the openat2/symlink sandbox-setup security fix; 0.11.2
+  includes the setuid-mode CVE-2026-41163 fix. Debian security data lists
+  bookworm as older/vulnerable for the newer CVE-2026-87766 line.
+- Therefore the image base was moved from node:22.19.0-bookworm-slim to
+  node:22.19.0-trixie-slim rather than relying on an unverified old package.
+
+rsi/Dockerfile now fails the build unless the installed bwrap:
+  - is executable and not setuid/setgid,
+  - advertises --disable-userns and --unshare-user in `bwrap --help`,
+  - prints a version,
+  - has setpriv and newuidmap present,
+  - and Node 22.19 can execute the TypeScript Supervisor entry
+    (`node /opt/rsi/src/main.ts --help`).
+
+This build-time check was NOT executed in this snapshot because Docker is
+unavailable. It is not a substitute for the real namespace probe on the target.
+
+NEW / CHANGED FILES
+
+- .github/workflows/rsi-linux.yml
+  Bounded Linux+Docker push/PR smoke, 45-minute job timeout, Node 22.19, locked
+  npm install, typecheck, deployment unit tests, host sysctl checks, compose
+  syntax validation, image build, image bwrap version/feature check, then the
+  real target suite with a 30-minute test timeout. Evidence is uploaded. The
+  workflow intentionally does not run the soak.
+
+- rsi/Dockerfile
+  trixie-slim base, explicit bwrap feature/version checks, setpriv/newuidmap
+  checks, TypeScript entry check. Existing no-privileged/capability/volume layout
+  remains in place.
+
+- rsi/compose.yaml
+  Retains no privileged mode, no docker.sock/host-root mount, cap-drop ALL plus
+  only SETUID/SETGID/CHOWN, deployment seccomp, pids limit and bounded logs.
+  Added core-dump limit 0 and comments tying the production compose contract to
+  the same strict target validation checks. Worker capabilities were not
+  expanded.
+
+- rsi/scripts/deployment-preflight.mjs
+  Uses inspectBubblewrapRuntime(), requires --disable-userns and
+  fs.protected_symlinks=1, retains the real UID/groups/CapEff probe, and prints
+  the actual bwrap version/features.
+
+- rsi/scripts/linux-target-docker.mjs
+  Shared target Docker orchestration: daemon check, strict host sysctl checks,
+  volume/container lifecycle, seccomp, read-only fixture/test mounts, no
+  privileged/docker.sock/host-root mount, log redaction, cleanup.
+
+- rsi/scripts/linux-validation.mjs
+  Bounded Linux validation runner. Modes: docker (default) and host. Builds or
+  reuses the image, verifies bwrap, creates fresh volumes, binds a temporary
+  fixture prompt read-only, runs the target suite, propagates exit codes, and
+  writes an optional redacted JSON report.
+
+- rsi/scripts/linux-smoke.mjs
+  Push-CI alias for the bounded validation; it never invokes soak.
+
+- rsi/scripts/linux-soak.mjs
+  Explicit optional soak. --hours defaults to 24. It uses the same target image
+  and security flags, samples health/resources/logs/process/recovery, writes a
+  JSON report, and is not called by the push CI workflow.
+
+- rsi/test/deployment/linux-target-harness.ts
+  Strict target prerequisite detection, real bwrap Worker harness, temporary
+  fixture-only paths, strict UID/GID/sysctl checks, and explicit failure instead
+  of skip when RSI_TARGET_STRICT=1.
+
+- rsi/test/deployment/linux-target-acceptance.test.ts
+  Real-bwrap target suite (see coverage below).
+
+- rsi/test/deployment/linux-target-restart-phase.ts
+  Two-phase real container restart check: prepare records read statistics and a
+  pending recovery notice, exits; verify runs in a second container on the same
+  /data and /state volumes and checks both survived and the notice is delivered.
+
+- rsi/test/deployment/linux-soak-runner.ts
+  In-container soak sampler using health.json, /proc, logs, watchdog state,
+  pending recovery notices, sleep deadline, and resource/disk samples.
+
+- rsi/test/deployment/linux-target-config.test.ts
+  Static/unit checks for the Dockerfile feature gate, scripts, strict flags,
+  cleanup, CI boundedness, and target coverage.
+
+- rsi/deploy/rsi.env.example
+  Documents the new host prerequisites and the bounded-smoke/soak commands. It
+  contains no prompt, Memory, credential, or task workflow content.
+
+- rsi/reports/linux-validation.txt
+  This report.
+
+TARGET SUITE COVERAGE
+
+The target suite is designed to run only inside the real Linux image with real
+bubblewrap and the test-mode faux provider. It covers:
+
+1. Clean /data and /state volumes: expect-empty assertion, first baseline
+   generation, real Worker pid/health/watchdog state.
+2. Sandbox filesystem protection using the actual Worker bash/Node tools:
+   manual system prompt, Memory/index markdown, RSI code, Pi source, active
+   immutable candidate, parent rename, symlink alias, /proc/self/root,
+   /proc/1/root, retained file descriptor, nested user namespace, and bind mount.
+3. proc/fd/alias/caps/PID: isolated /proc, host Supervisor pid hidden, nested
+   userns denied, CapEff=0, distinct UID/GID, namespace PID different from host
+   bwrap PID, Watchdog records the host bwrap PID.
+4. Broker update visibility: the Supervisor atomically replaces Memory while a
+   sandboxed Worker loop reads the same read-only directory mount; the new bytes
+   become visible without restarting the Worker.
+5. Static syntax rejection and 3-second Mock-load timeout for a while(true)
+   candidate; neither reaches a real reload or changes the active digest.
+6. A valid reload that registers a real tool, calls it after loading, then keeps
+   the exact generation/digest through three healthy turns and promotes that
+   same digest to external LKG.
+7. A post-reload delayed crash and a post-reload event-loop hang. Each must be
+   killed/restarted by the Watchdog, restore the exact external LKG digest, and
+   deliver the recovery notice in the first recovery turn.
+8. Explicit sleep: sleeping health with a future deadline, sleeping heartbeat,
+   Worker crash/restart during sleep, original deadline preservation, one prompt
+   wake after the deadline, and post-wake recovery notice.
+9. Persistence across restart: the suite also exercises a Supervisor restart
+   with the same paths, and linux-validation.mjs then performs an actual
+   two-container restart on the same /data and /state volumes. Read statistics
+   and a pending recovery notice must survive and be served by the second
+   container.
+10. The pinned web_search plugin uses only a local mock HTTP endpoint under the
+    real Worker. No external provider is contacted.
+
+No test writes a production prompt or Memory. The prompt is a temporary fixture
+("TARGET-VALIDATION-HUMAN-PROMPT-FIXTURE") mounted read-only and removed with
+the test directory. The target suite does not inject markdowns/operations or
+security documentation into the Agent system.
+
+HOST / DEPLOYMENT PREREQUISITES (FAIL CLOSED)
+
+Before Linux/Docker acceptance can pass:
+
+1. Linux host with a working Docker daemon and permission for the invoking user
+   to build/run containers.
+2. Kernel unprivileged user namespaces enabled for the container
+   (user.max_user_namespaces > 0; distro-specific userns switch if present).
+3. fs.protected_hardlinks=1 and fs.protected_symlinks=1 on the host kernel.
+4. Docker custom seccomp support and rsi/deploy/seccomp-bwrap.json accepted by
+   the installed Docker/libseccomp version.
+5. On AppArmor hosts, the container profile must allow the bwrap
+   user/PID/IPC/UTS/mount namespace probe. The probe failure is fatal; do not
+   disable the security check or fall back unsandboxed.
+6. bubblewrap must be non-setuid, expose --disable-userns, and pass the real
+   namespace/UID/groups/CapEff probe. The image now uses Debian trixie and
+   verifies the feature at build time.
+7. setpriv and newuidmap must exist. The Supervisor stays root only inside the
+   constrained container to start bwrap as the distinct non-root Worker UID;
+   Docker capabilities remain cap-drop ALL plus SETUID/SETGID/CHOWN only.
+8. No privileged mode, no docker.sock mount, no host root mount. The target
+   runner and test container keep that boundary.
+9. Node 22.19 TypeScript execution must work. The Dockerfile checks
+   `node /opt/rsi/src/main.ts --help` at build time.
+10. The manual operator prompt remains an external non-empty .txt. Target tests
+    use only their temporary fixture; they never install a production prompt.
+
+HOW TO RUN ON THE REAL TARGET
+
+Bounded smoke (also what push CI runs):
+
+  node rsi/scripts/linux-smoke.mjs
+
+or explicitly:
+
+  node rsi/scripts/linux-validation.mjs \
+    --mode docker \
+    --image rsi-agent:linux-validation \
+    --timeout-ms 1800000 \
+    --report /var/tmp/rsi-linux-validation.json
+
+Host mode (already on a Linux target with root/bwrap; no Docker isolation layer):
+
+  node rsi/scripts/linux-validation.mjs --mode host --report /var/tmp/rsi-host-validation.json
+
+Optional soak, explicit and NOT part of push CI:
+
+  node rsi/scripts/linux-soak.mjs \
+    --hours 24 \
+    --sample-ms 30000 \
+    --report /var/tmp/rsi-linux-soak.json
+
+A short soak is only a diagnostic. It must not be reported as a completed 24h
+soak. The default is 24h and the script makes no external provider calls.
+
+CLEANUP / DATA SAFETY
+
+- The validation runner creates uniquely named Docker volumes/container with an
+  rsi-validation prefix and uses volume-nocopy so the first baseline really
+  starts from empty /data and /state rather than image-seeded directories. It
+  removes only those own resources, never user volumes. --keep is opt-in.
+- The soak runner uses the same isolation and an rsi-soak prefix; it removes only
+  its own container/volumes/temp directories unless --keep is set.
+- The target suite creates only temporary run directories under the supplied
+  /data and /state volumes and removes them. It never edits the operator's
+  manual prompt, production Memory, or user data.
+- The host prompt is a temporary fixture file mounted read-only into the test
+  container. The target test bind-mounts only rsi/test read-only.
+- Logs are redacted for secret-like environment values and common key/token
+  patterns. Host provider credentials are not passed into the test container.
+
+CI BEHAVIOR
+
+.github/workflows/rsi-linux.yml triggers on rsi/** pushes/PRs and manual
+workflow_dispatch. The job:
+  - installs Node 22.19 and locked npm dependencies;
+  - runs typecheck and deployment unit tests;
+  - records host kernel/userns/Docker state and fails if protected hardlinks or
+    symlinks are not 1;
+  - validates compose syntax with a temporary fixture .env (does not start
+    production);
+  - builds the real image and verifies bwrap --version/--disable-userns;
+  - runs the bounded target validation with a 30-minute test timeout inside a
+    45-minute job;
+  - uploads the validation report/log.
+The workflow does not run the 24h soak. No workflow result exists yet; this
+snapshot has only the YAML and local unit/static results.
+
+EXPLICIT PENDING ITEMS (NOT CLAIMED AS PASSED)
+
+1. Docker image build and pull of node:22.19.0-trixie-slim were not executed.
+2. Real bwrap namespace/mount/UID/groups/CapEff probe on Linux was not executed.
+3. Docker seccomp profile acceptance, AppArmor interaction, setpriv/newuidmap,
+   volume permissions, healthcheck, and container restart were not executed.
+4. The full target suite was not executed on Linux/Docker. The target harness is
+   intentionally stricter than the Windows unit run.
+5. The optional 24-hour soak was not executed, not started, and is not claimed.
+6. GitHub Actions has not run the new workflow.
+7. The P0 fixes owned by other independent branches are not merged into this
+   snapshot and must not be called passed here. The target suite is written to
+   fail until the following are actually fixed/integrated (the exact branch
+   partition is owned by those workstreams):
+   - P0-1 preflight executable/args and cwd outside protected RSI source;
+   - P0-2/P0-3 provider API guard timing and load-time provider mutations;
+   - P0-4 rejected reload cleanup/rollback of candidate MCP/tools/hooks;
+   - P0-6 preflight result/stderr alias protection;
+   - P0-7 Watchdog host bwrap PID versus Worker namespace PID.
+   It also exercises the final-audit P1 areas: IPC authentication, sleep restart
+   heartbeat, managed aliases, metadata finalizer, Pi agent config boundary,
+   launch failure cleanup, log redaction, and markdown seed. Those remain
+   integration checks, not claims of current passing behavior.
+
+FINAL WIRING NOTES FOR THE FIX BRANCHES
+
+- Keep the target script strict: RSI_TARGET_STRICT=1 is set by
+  linux-validation.mjs and linux-soak.mjs. Do not add skip fallbacks for missing
+  bwrap/userns/seccomp/AppArmor; fix the host or fail the target run.
+- If a fix branch changes preflight executable/args/cwd, the target suite's
+  baseline and static/Mock reload tests are the acceptance gate.
+- If a fix branch changes Watchdog PID identity, keep the target assertion that
+  health/watchdog use the host bwrap PID while the Worker inside reports a
+  different namespace PID.
+- If a fix branch changes sleep persistence, keep the target assertion that a
+  restarted Worker reports sleeping and preserves the original deadline.
+- If a fix branch changes candidate cleanup or IPC auth, the crash/hang and
+  reload rollback tests must still pass with the exact LKG digest.
+- After merging the fixes, run in this order on a real target:
+  1. npm run check:types
+  2. deployment unit tests
+  3. node rsi/scripts/linux-validation.mjs --mode docker ...
+  4. any additionally required branch regression suite
+  5. only then, explicitly, node rsi/scripts/linux-soak.mjs --hours 24 ...
+- Do not mark Linux/Docker/24h complete based on this report. This report only
+  proves the scripts/config/unit wiring were created and locally checked; it
+  explicitly records the target execution as pending.
+
+INTEGRATION UPDATE (2026-10-27, current worktree)
+
+The four repair workstreams are now integrated into this worktree. The P0-1
+preflight Node+argv/safe-cwd wiring, P0-2/P0-3 provider guard timing and
+load-time pending checks, P0-4 rejected-candidate cleanup, P0-6 diagnostic
+no-follow handling, P0-7 Watchdog host-PID identity, P1 IPC authentication,
+sleep restart state, managed aliases, and Runtime metadata stripping are no
+longer "unmerged branch" items. The current local result is 311 tests: 294
+pass, 0 fail, 17 skip; npm run check exits 0. The operator Pi settings/models/
+auth boundary (P1-5) and container five-document Markdown seed (P1-8) are now
+implemented with review2 regressions.
+
+This does NOT change the target status above. The nine linux-target-acceptance
+tests still skip on win32; the strict runner exits 1 because this host is not
+Linux and has no bwrap/Docker. Docker build/up, real bwrap namespace/mount/
+UID/FD/PID checks, seccomp/AppArmor, restart persistence, and the optional 24h
+soak remain PENDING. Local launchers are not evidence for those properties.
+
+The remaining production blockers are target execution and real external
+provider/CI validation: operator config is now read-only in the Worker with a
+persisted restart baseline, and the container seed now includes all five
+knowledge Markdown files with a consistent index. Neither is claimed as
+Linux/Docker-verified until the strict target run and optional 24h soak execute
+on a real Linux host.

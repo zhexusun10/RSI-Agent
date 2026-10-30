@@ -1,0 +1,365 @@
+INTEGRATION UPDATE: rsi/src/main.ts wires ReloadCoordinator, Watchdog, LKG restore,
+first-turn recovery notices, request preflight, and real Worker session.reload. See
+rsi/reports/integration.txt.
+
+RSI-AGENT RELOAD / WATCHDOG / CRASH RECOVERY HANDOFF
+Generated: 2026-10-27
+Status: implementation + tests complete in the assigned scope. Plain-text report, not a prompt.
+
+SCOPE DELIVERED
+- rsi/src/reload/**: immutable candidate snapshots, Pi-compatible discovery, static
+  syntax/module-graph preflight, hard 3-second Mock load preflight, exact generation/digest
+  reload coordination, three-turn probation, LKG promotion, atomic LKG restore, persistent
+  reload journal, external reload gate, and Worker-side reload guards.
+- rsi/src/watchdog/**: external Watchdog, heartbeat/reload/exit monitoring, process-tree
+  termination, LKG rollback/restart with backoff, bounded crash logs, and durable first-turn
+  recovery notifications.
+- rsi/test/reload/**: candidate, preflight, lifecycle, gate, and journal tests.
+- rsi/test/watchdog/**: Watchdog, notification, backoff, restart-interruption, and no-fake-
+  rollback tests.
+- rsi/reports/recovery.txt: this handoff.
+- No pi/ file was modified. No shared module, package.json, lockfile, tsconfig, script, or
+  dependency metadata was changed. No Git commit was made.
+
+PUBLIC IMPLEMENTATION ENTRY POINTS
+- rsi/src/reload/index.ts exports all reload modules.
+- rsi/src/watchdog/index.ts exports all Watchdog modules.
+- Main classes:
+  ImmutableCandidateStore, ReloadPreflight, SandboxLauncherPreflight,
+  ReloadCoordinator, ReloadGate, ReloadStateStore, ReloadSnapshotStore,
+  RecoveryNoticeStore, Watchdog.
+- Main guards:
+  guardReloadCommand, guardExtensionCommandContext.
+- Main child runners:
+  rsi/src/reload/workers/static-check-worker.ts,
+  rsi/src/reload/workers/mock-load-worker.ts.
+
+RELOAD CALL FLOW (Supervisor-authoritative)
+1. The Supervisor prepares a candidate:
+   ImmutableCandidateStore.prepareCandidate({ generation, sourceRoots, trustedDependencyRoots })
+   - copies the actual source roots into a staging directory
+   - discovers Pi-compatible entries without executing plugin code
+   - computes a content-addressed payload digest and a manifest digest that also binds the
+     source roots, entries, trusted dependency roots, package pins, generation, and counts
+   - refuses source changes during the copy, links, path escapes, unsafe files, and writes a
+     read-only candidate directory
+   - renames the staging tree atomically to <snapshotDir>/candidates/<candidateId>.
+2. A /reload request arrives only through the external gate:
+   ReloadGate.requestReload({ source: "control" | "command-shim" |
+   "extension-command-context" | "worker", sessionId?, reason, candidateId? })
+   - command-shim and extension-command-context requests must name a currently registered
+     active Pi session; otherwise the gate returns SESSION_INACTIVE.
+   - identical in-flight requests with the same dedupeKey are coalesced.
+3. ReloadCoordinator.requestReload:
+   a. Verifies the candidate digest and generation.
+   b. Runs ReloadPreflight unless this process already validated the exact candidate. A
+      candidate marked "validated" by an earlier process is revalidated after restart.
+   c. Persists the "reloading" state with attemptId, generation, digest, path, startedAtMs,
+      and deadlineMs before any real reload.
+   d. Calls ReloadObserverPort.beginReload (normally the Watchdog) and arms the reload
+      deadline.
+   e. Calls PiSdkReloadPort.reload with the exact read-only candidate snapshot.
+   f. Requires the returned generation and digest to equal the preflighted candidate. It
+      re-verifies the candidate bytes after real load before activation.
+   g. Persists active generation/digest/path and phase "probation", seeds health turns to
+      zero, clears pending/reloading, and calls observer.completeReload.
+   h. On any failure, persists the failure, removes the attempt from "reloading", keeps the
+      previous active generation untouched, and returns a tool-error-shaped result. The SDK
+      reload is never called after a failed preflight.
+4. Only a successful real reload may enter probation. A heartbeat, preflight success, or
+   Mock load never counts as a conversation turn.
+
+ALL /reload ENTRY POINTS
+- Control tool: call ReloadGate.requestFromControl or ReloadGate.requestReload.
+- Command shim: use guardReloadCommand(gate, request) as the only command body that may start
+  a reload. Do not call the SDK locally.
+- Extension command context: wrap the context with guardExtensionCommandContext(ctx, gate,
+  request). Its reload() calls the external authority and never calls the original ctx.reload.
+- Worker IPC: route reload.preflight/reload.started to the Supervisor gate, not to a local
+  extension runtime action.
+- The real Pi reload lives behind PiSdkReloadPort (implemented by Worker/Supervisor
+  integration). It must be invoked only after the Supervisor persisted reloading; it should
+  return the actually loaded generation and digest. This is the single SDK reload path.
+- ReloadGate.registerSession must be called for every active Pi session and the returned
+  unregister function called on session shutdown/replacement. This is what lets the external
+  gate cover all active sessions instead of only one worker connection.
+
+PREFLIGHT DETAIL
+- Static check: external child process, trusted TypeScript compiler 5.9.3 parser, independent
+  timeout (default 10,000 ms, capped at 120,000 ms).
+  - Covers every Pi-loaded ts/js entry and recursively covers relative/absolute local imports.
+  - Handles TypeScript extension remapping (.js -> .ts), directory/package resolution,
+    ESM-only package exports with import/default/require conditions, and wildcard exports.
+  - Package imports must resolve inside the candidate payload or inside a declared canonical
+    read-only trustedDependencyRoot. A writable ancestor node_modules is rejected. This is how
+    a snapshot cannot silently keep importing newly-edited dependency code.
+  - Type-only imports may be missing; runtime imports may not.
+  - Only syntax diagnostics are required to pass. Type-checking is intentionally not a gate
+    because a valid Pi plugin may have optional peer/type-only dependencies.
+- Mock load: external child process, hard parent deadline 3,000 ms and explicit process-tree
+  termination.
+  - Uses the installed Pi 1.4 discoverAndLoadExtensions on the candidate's explicit entry
+    paths, so the Mock ExtensionAPI is the real Pi 1.4 registration API rather than a
+    hand-rolled approximation.
+  - Binds the Pi runtime action methods normally bound by ExtensionRunner before session
+    start, then invokes session_start and resources_discover handlers with a compatible Mock
+    ExtensionContext. This keeps pi-continuity 0.3.1 and pi-better-web-search 0.1.5 loading in
+    preflight instead of false-rejecting them.
+  - Detects load-time process.exit (no result + nonzero exit), uncaught exceptions and
+    unhandled rejections (child result contains stack), never-settling async factories
+    (keep-alive ensures the parent deadline classifies them as timeout), top-level infinite
+    loops (parent SIGKILL/process-tree kill), and timers that throw during a bounded 250 ms
+    settle window.
+  - Global fetch is replaced with a throwing function before plugin code is imported, and no
+    model/session/provider is created. The harness itself makes no model or external call.
+  - Parent reads bounded result/stderr, keeps timeout, exit code, signal, child stack, and a
+    bounded stderr tail, and returns them in the preflight error text. formatPreflightToolError
+    ends with "Real Pi reload was not performed."
+- Candidate digest is checked immediately before static check, after static check, after Mock
+  load, again before real reload, after real reload, and before LKG promotion.
+- The preflight child cwd is the worker directory, not the candidate path, to avoid Windows
+  cwd MAX_PATH failures. Candidate entry paths are absolute and the candidate path is passed
+  explicitly; bwrap policy must mount the candidate snapshot and result temp dir appropriately.
+
+CANDIDATE PACKAGING AND LIMITS
+- Candidate input is one or more dedicated source roots. Each root is canonicalized; symlink
+  aliases, symlink entries, hardlinked files, non-regular files, overlapping roots, and roots
+  that contain protected state/markdowns paths are rejected.
+- Default limits: 2,000 files, 4 MiB per file, 64 MiB total. The whole source root is copied,
+  including package.json, pi.extensions, local libs, and any local node_modules tree. This
+  avoids the "top-level ts only" failure mode. Trusted dependency roots are read-only runtime
+  package roots and are recorded in the manifest for static resolution.
+- Pi discovery is mirrored without execution:
+  - package.json pi.extensions entries, resolved relative to the package and checked against
+    path escape and symlinks;
+  - index.ts/index.js for a package directory;
+  - direct extensions/*.ts|*.js and one-level subdirectory index/package manifests for an
+    extensions directory;
+  - explicit entry lists are also supported.
+- Candidate payload is read-only (0444/0555) and content-addressed; the manifest itself is
+  read-only. Verify rejects extra files, changed bytes, added symlinks/hardlinks, writable
+  files, missing entries, size/count drift, and id/digest mismatch.
+- CandidateId is gen-<6 digits>-<first 12 hex of digest>; generation and digest are bound
+  through prepare -> preflight -> real load -> probation -> promotion.
+- LKG is a separate read-only copy under <snapshotDir>/lkg/<candidateId>, not just a pointer
+  into a prunable candidate. Promotion re-verifies the exact active candidate and copies that
+  exact snapshot. Candidate/LKG pruning keeps bounded history and never keeps a pointer to a
+  deleted LKG. pruneSnapshots runs on prepare/validate/load/promotion/baseline/rollback and
+  retains active, pending, reloading, and LKG paths plus a bounded recent history.
+- Source restore swaps the whole source root from the LKG payload with a crash journal:
+  staging -> backup -> install, with startup recovery of prepared/backed-up/installed
+  transactions. Restored source files are writable so the Agent can edit the next candidate.
+  Files that appeared after the snapshot inside that dedicated plugin root are removed; this
+  is intentional so a bad auto-discovered file cannot survive rollback.
+- Memory.md, managed Markdown, user task files, and any other path outside the registered
+  source roots are never part of the swap. The restore allowlist and forbidden-root list are
+  supplied by the Supervisor and checked before any rename. No candidate code is executed to
+  decide a host writable path.
+- Production Worker must load the explicit paths returned by
+  ReloadCoordinator.getActiveExtensionSet().entryPaths from the read-only active snapshot.
+  Do not leave the writable plugin directory on Pi's auto-discovery path after a rollback.
+  After a rollback the source directory is restored for future edits and the active pointer is
+  the LKG snapshot. The Supervisor should launch/restart the Worker with the snapshot path,
+  not with auto-discovery of the writable source.
+- Multi-root restore is transactional per root, not a global multi-directory atomic operation.
+  A crash mid-way is recovered per root at startup; the active loader path remains the LKG
+  snapshot, so production load is safe even if a later root retry is needed.
+
+PERSISTENT RELOAD STATE
+- <state>/plugins/state.json is written with AtomicJsonFile: complete temp -> fsync -> backup
+  of previous main -> atomic rename. Interrupted writes leave either the old main, new main,
+  or a valid backup. Invalid main falls back to backup; totally bad state becomes a safe empty
+  state with diagnostics.
+- Persisted fields include active, pending candidate (prepared/validated), reloading attempt,
+  health attempt/generation/digest/consecutive count/last turn key/index, LKG, last failure,
+  bounded history (30 entries), and updatedAtMs.
+- On load, an interrupted reload is converted into a failed record; a bad LKG is cleared and
+  diagnosed rather than used; an unusable active snapshot is cleared, never silently promoted.
+- Candidate prepared/validated/failed, reload in progress, loaded/probation, promoted, and
+  rolled-back transitions are all persisted. Reload or crash clears probation.
+- SnapshotStorePort.createLkg refuses unless the persisted health record for the exact active
+  generation/digest has three healthy turns. SnapshotStorePort.saveState cannot invent an
+  active snapshot path.
+
+HEALTH SEMANTICS
+- HealthTurnObservation is recorded only from agent_settled/health.turn wiring. Healthy means:
+  not aborted, at least one assistant message, and stopReason not "error" or "aborted".
+- Three consecutive healthy settled runs promote the exact loaded candidate to LKG. Tool-use
+  turns are healthy. A provider/assistant error or aborted turn resets the consecutive count.
+  It does not trigger plugin blame or a fake rollback; only process exit/hang/reload deadline
+  trigger Watchdog rollback.
+- Duplicate/out-of-order events are ignored by attemptId + generation + turnIndex/last key.
+  A heartbeat has no health path at all. Reload resets health to zero; crash/rollback clears it.
+
+WATCHDOG CALL FLOW
+- Integration calls:
+  watchdog.recordWorkerStarted({ pid, startedAtMs, generation })
+  watchdog.recordHeartbeat(HeartbeatReport, now)
+  watchdog.beginReload({ attemptId, candidateId, generation, digest, deadlineMs })
+  watchdog.completeReload({ attemptId, generation, digest })
+  watchdog.failReload({ attemptId, reason })
+  watchdog.recordWorkerExit(exitCode, signal, now, { pid, stderrTail })
+  watchdog.markExpectedStop(reason, "reload") before stopping a Worker for a planned reload
+  watchdog.markOperatorStop(reason) for operator/Supervisor shutdown
+  watchdog.tick(now) is public for injected/fake time.
+- Heartbeat lease: default timeout 30,000 ms. Heartbeat state "sleeping" suspends the lease
+  (explicit sleep is not an event-loop hang). Heartbeat state "busy"/"reloading" uses the busy
+  lease multiplier (default 2x). Normal long async network/tool waits keep the Worker event
+  loop alive and keep heartbeats flowing. A truly blocked event loop stops heartbeats and is
+  killed after the lease. Duplicate/old heartbeat sequences do not extend the lease.
+- Reload deadline: beginReload arms an absolute deadline. Tick past it kills the Worker tree,
+  calls recovery.onReloadTimeout for journal cleanup, and restores LKG.
+- Crash/exit classification:
+  - expected operator stop => stopped, no restart, no crash notice;
+  - normal operator SIGTERM/SIGINT => stopped, no crash loop (explicitly not a plugin crash);
+  - expected clean reload stop => no incident; expected nonzero/crash signal => incident;
+  - stale exit with an old pid is ignored when the caller passes pid;
+  - unexpected exit => crash incident; bounded stderr/stack is captured.
+- Recovery sequence: getLkg -> (restore exact LKG bytes) -> recordRollback in reload journal ->
+  enqueue durable recovery notice -> schedule restart with exponential backoff. Before every
+  launch the Watchdog re-applies the exact LKG bytes again, so a resumed/interrupted recovery
+  can never start from a half-restored source tree. No LKG means explicit "unrecoverable"
+  diagnostic and no fake rollback. Restore failure retries with backoff and only after the
+  retry budget is exhausted emits a "rollback-failed" notice that does not claim success.
+- Restart budgets: base 1,000 ms, exponential cap 60,000 ms, default max 5 restarts, stable
+  reset after 120,000 ms of healthy life, missed-heartbeat limit 1. Exhaustion persists
+  phase "unrecoverable" plus last error; it never silently dies or hot-loops.
+- Watchdog state is in <state>/watchdog.json (atomic/backed up). Crash incident history is
+  bounded (20), notice log tail is bounded (8 KiB), and watchdog logs are bounded (256 KiB).
+- Recovery notification outbox is durable under <state>/control/recovery-notices.json:
+  - nextForFirstTurn() returns the oldest pending notice without deleting it; it increments
+    deliveryAttempts.
+  - The Supervisor injects formatRecoveryNotice(notice) before/with the first wake-up turn.
+  - acknowledge(notificationId) removes it only after confirmed delivery and records delivered
+    IDs. Restarts between delivery and acknowledgement can repeat the same notification; after
+    acknowledgement duplicates are suppressed and the notice is not resurrected.
+  - The first crash-rollback text starts with the required Chinese sentence:
+    "你刚才写的插件导致系统崩溃，已自动回滚到上一个已知安全快照。" and includes the bounded
+    crash log. crash-without-LKG and rollback-failed notices explicitly avoid claiming a rollback.
+
+INTEGRATION EVENTS TO WIRE
+Worker -> Supervisor:
+- heartbeat: feed Watchdog.recordHeartbeat. Heartbeats are not health turns.
+- health.turn / agent_settled observation: map to HealthTurnObservation with the active
+  attemptId/generation and call ReloadCoordinator.recordHealthTurn. Do not derive from
+  agent_end; agent_settled is final idle.
+- reload.preflight / reload.started / reload.failed: route to ReloadGate/ReloadCoordinator,
+  never directly to a Worker-local SDK reload.
+- reload.completed: the Supervisor's PiSdkReloadPort must verify actual generation/digest and
+  return them; call coordinator.complete path only after that verification.
+- worker.ready / process exit / stderr tail: call recordWorkerStarted / recordWorkerExit with
+  pid and stderrTail; keep stderr in a bounded log file.
+Supervisor -> Worker:
+- control.reload is the only real Pi reload trigger after the Supervisor persisted reloading.
+  The Worker should call its SDK session.reload (or command-context reload) and then report the
+  loaded generation/digest.
+- control.shutdown/operator shutdown: markOperatorStop before stopping; markExpectedStop for
+  planned reload replacement.
+External Supervisor -> Watchdog:
+- Watchdog recovery port implementation:
+  getLkg -> ReloadCoordinator.getLkg;
+  restoreLkg -> ImmutableCandidateStore.verifyLkg + restoreCandidateSources with the
+  Supervisor allowlist;
+  recordRollback -> ReloadCoordinator.markRolledBack (atomic active pointer/history);
+  startFromSnapshot -> WorkerLifecyclePort.start with the LKG snapshot path/entry set;
+  recoverInterruptedRestore -> ImmutableCandidateStore.recoverInterruptedRestores;
+  onReloadTimeout -> fail the reload journal/invalidate the stale attempt;
+  onUnrecoverable -> persist diagnostics/notify operator.
+- First turn: call notificationStore.nextForFirstTurn before the first provider request,
+  inject its text, and acknowledge only after the message is accepted by the session/UI.
+- The Supervisor must arm beginReload's deadline with a value that covers preflight + reload
+  and must use a process-tree-capable SandboxLauncher for preflight Mock and production Worker.
+
+VERIFIED CAUSE-TO-TEST MATRIX
+- Syntax error: static TS diagnostics; Mock skipped.
+- Missing local import: static module graph error with importer path.
+- Missing package/untrusted writable node_modules: static rejection unless inside candidate or
+  trusted read-only root.
+- Top-level while(true): real static passes, Mock child killed by parent after 3,000 ms.
+- Async factory never resolves: keep-alive prevents false success; parent kills at 3,000 ms.
+- Uncaught timer exception: Mock child result contains stack/error.
+- Load-time process.exit: no result + exit code preserved.
+- Delayed runtime crash: Watchdog exit recovery creates incident/rollback notice.
+- Mock passes but real reload fails: coordinator remains inactive and does not promote.
+- Fewer than 3 healthy turns: no LKG. Third healthy turn: exact LKG created/promoted.
+- Duplicate health events: ignored by turn key/index.
+- Source directory changes during snapshot: CANDIDATE_CHANGED.
+- Restart interruption: journal resumes pending recovery, LKG re-applied before start.
+- Valid initial baseline: baseline LKG created after preflight + real load.
+- No LKG: unrecoverable diagnostic, no restore or restart, no fake rollback.
+- Rollback bytes: source-root bytes match LKG snapshot; Memory/docs/user files outside roots
+  are preserved; restored plugin source is writable.
+- Recovery notice: first-turn text, durable across restart, exactly once after acknowledge,
+  no resurrection by duplicate incident.
+- Sleep/busy: sleeping heartbeat suspends lease; busy async wait keeps lease/continues
+  heartbeats; no false hang rollback.
+- Reload deadline: stuck reload killed and rolled back.
+- Operator SIGTERM: stopped, no restart.
+- Backoff/exhaustion: exponential delays and bounded unrecoverable state.
+- Bad/interrupted state files: backup recovery and interrupted-reload conversion.
+
+COMMANDS AND RESULTS (this host)
+- `npm run check:types`: pass (exit 0).
+- `npm test`: 86 tests, 86 pass, 0 fail (Node test runner included the 43 new reload/watchdog
+  cases and the existing foundation cases).
+- `npm run check`: pass; 86/86 tests, plugin discovery loaded:
+  ./rsi/node_modules/pi-continuity/extensions/index.ts
+  ./rsi/node_modules/pi-better-web-search/extensions/index.ts
+  final line "rsi foundation checks passed."
+- Real child-process preflight tests were run on this host, not mocked:
+  - top-level while(true) and never-settling async factory each reach the 3,000 ms parent
+    deadline and are killed; the test records timeout diagnostics.
+  - static TypeScript module-graph parsing and pinned Pi 1.4 plugin Mock loads pass.
+  - Mock load makes no model/provider call and denies fetch.
+- Host used: Windows MINGW64, Node 24.16.0, npm 11.13.0. Target remains Linux Node >=22.19.0.
+
+PENDING LINUX/BWRAP AND INTEGRATION CHECKS
+1. Production SandboxLauncher policy must mount:
+   - candidate snapshot read-only at its absolute candidate path;
+   - preflight result/temp directory writable (currently under snapshotDir/preflight-tmp);
+   - RSI source and node_modules read-only for the static/Mock worker entries;
+   - Worker source/entry and LKG snapshot read-only for production load.
+   The current module uses the public SandboxLauncher interface; its adapter does not mutate
+   shared SandboxPolicy. The Supervisor-owned bwrap policy must add these mounts because the
+   shared createSandboxPolicy hides stateDir and the candidate lives under state. If preflight
+   runs under a distinct worker uid, the result/stderr temp directory and files must be
+   writable/readable for that uid and the Supervisor; this is an integration policy decision,
+   not an implicit host-path change made by candidate code.
+2. Verify process-group termination under actual bwrap/SandboxHandle. LocalProcessGroupLauncher
+   implements detached groups/taskkill for local tests, but production kill semantics depend on
+   the injected SandboxLauncher and Watchdog ProcessTreePort.
+3. Wire the real Worker extension command context and command shim to the guards; verify no
+   direct ctx.reload remains reachable from any active session. The module cannot patch Pi
+   source (pi/ is read-only).
+4. Wire real PiSdkReloadPort to the published Pi 1.4 session/extension reload path and report
+   actual loaded digest/generation. Mock load proves API/plugin compatibility, not a full Pi
+   session/model loop.
+5. Mount the LKG snapshot read-only and confirm the Supervisor never starts production Pi with
+   auto-discovery of the restored writable source root after rollback.
+6. Verify Worker stderr is redirected to the bounded file path given to Watchdog and that
+   recordWorkerExit receives pid/stderrTail. Passing pid prevents an old exit from terminating
+   a newly restarted Worker.
+7. Run the same preflight kill tests under Linux (SIGKILL process group, no Windows MAX_PATH
+   workaround) and verify Docker/bwrap behavior.
+
+KNOWN LIMITS / EXPLICIT NON-CLAIMS
+- Mock preflight is not a full Pi session. It runs real Pi extension loading and
+  session_start/resources_discover registration, but not a model request, provider stream,
+  tool execution, or UI loop. Timers/errors that fire after the 250 ms settle window are the
+  production Watchdog's job. No real model is called.
+- The Mock network denial is a fetch guard plus no model/session creation; the architecture
+  keeps container network unrestricted. Preflight is not claimed as an OS network sandbox.
+- Static checking is syntax/module-resolution only, not full type checking. Missing type-only
+  imports are allowed because valid Pi packages may depend on optional peers.
+- Candidate source roots must be dedicated plugin/extension roots. Restoring a candidate swaps
+  that root wholesale, so files added there after the snapshot are removed. Other user/data
+  directories are preserved; overlapping/protected roots are rejected.
+- Multi-root restore is per-root transactional; the read-only active LKG snapshot, not the
+  writable source tree, is the production load path after rollback.
+- Recovery notices are at-least-once across a crash between successful injection and
+  acknowledgement, with notificationId dedupe and no resurrection after acknowledgement.
+- Provider/assistant errors are health observations, not plugin crash evidence. They reset the
+  consecutive healthy count but do not create a crash notice or automatic rollback by
+  themselves.
+- No Git commit or automatic Git operation is performed; snapshots are filesystem versions.
+- No Agent prompt was written, and no native Pi file was changed.

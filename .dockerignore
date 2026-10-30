@@ -1,0 +1,15 @@
+.git
+.gitignore
+.artifacts
+pi
+**/node_modules
+rsi/node_modules
+rsi/.env
+rsi/secrets
+rsi/test
+rsi/reports
+rsi/coverage
+rsi/dist
+**/.env
+**/*.log
+**/*.tsbuildinfo

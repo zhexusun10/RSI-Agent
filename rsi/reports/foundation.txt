@@ -1,0 +1,184 @@
+INTEGRATION UPDATE: shared contracts now include control.request, docs.readView, runtime.turn, worker.abort, agent lifecycle/exception events, candidate entryPaths, and pluginSourceDir. See rsi/reports/integration.txt.
+
+RSI-AGENT FOUNDATION HANDOFF (plain text, not a prompt)
+Generated: 2026-10-26
+Host used for validation: MINGW64_NT (Windows), Node 24.16.0, npm 11.13.0
+Target: Linux Docker with Node >=22.19.0
+
+STATUS
+- rsi/ is a new independent TypeScript ESM package named rsi-agent.
+- Only the foundation is implemented. Worker, Supervisor process, document broker, sandbox
+  launcher, preflight runner, LKG store, Watchdog, autonomous loop, control server, and main
+  entry are NOT implemented here. Do not treat the presence of contracts as runtime completion.
+- No Agent prompt was written or changed. The runtime must load a human-provided external .txt
+  system prompt and fail closed when it is missing or invalid.
+- rsi/src/shared/ is the only source implementation area created. No pi/ file was modified.
+
+VERIFIED INSTALL AND LOCK
+- rsi/package.json, rsi/package-lock.json, rsi/tsconfig.json, rsi/.gitignore exist.
+- Installation used: npm install --ignore-scripts --no-audit --no-fund
+- It added 122 packages and generated package-lock.json (lockfileVersion 3).
+- Direct dependencies (exact; no ranges):
+  @earendil-works/pi-agent-core 1.4.0
+  @earendil-works/pi-ai 1.4.0
+  @earendil-works/pi-coding-agent 1.4.0
+  pi-better-web-search 0.1.5
+  pi-continuity 0.3.1
+  typebox 1.3.27
+- Dev dependencies: @types/node 22.19.19, typescript 5.9.3.
+- Pi and plugin integrity values recorded in the lock include:
+  @earendil-works/pi-coding-agent sha512-Z41LpZ3yYHSC/UUps6Mr39UMFPwH8elhJBG9DY1P7kuzsE5qSK/6eMj2EHzO5evJRQWLbKSqUMw+4nCNtIyiQg==
+  @earendil-works/pi-ai sha512-hQM/C4+1w8rHYACzDDf+0vQMnEnpzIop1tptIERVgR3ZeT/hHSzBNG8PaWPgxWQjqSeKCyBZSyp8uTT6eKK1pQ==
+  @earendil-works/pi-agent-core sha512-PoKY84SKUwnt7S5QBZaGUqfNO1kjP3KHpHUA9QpFTj4cOjaVWMYIcBPJ6FDRCdE8Zen9OSECQUd0uUfVgtSmgA==
+  pi-continuity sha512-bd7IB76n6XvMfYmYS+IaD9crjPqgTCujQmVdlEjiHatOAnUPwsDUZzrAXIBXdM1kNMQyb16giPE2CrGc9cZxlg==
+  pi-better-web-search sha512-DmIiyZ4W73wKahVLslMeU29YrpmaXYzP2t4iJ1Fx99ycuDjw2hU372E61feLjOU7tgSzhYSEicDHTvgjjxCLvg==
+- No Pi build, no Pi full test suite, and no third-party lifecycle scripts were run.
+
+PINNED PI PLUGINS
+- pi-continuity@0.3.1: npm manifest declares pi.extensions ["./extensions/index.ts"];
+  peer deps @earendil-works/pi-coding-agent * and @earendil-works/pi-ai *.
+- pi-better-web-search@0.1.5: npm manifest declares pi.extensions ["./extensions/index.ts"];
+  peer deps @earendil-works/pi-ai *, @earendil-works/pi-coding-agent *, typebox *.
+- These were checked from the npm registry/package manifests, not from a same-named GitHub project.
+- npm run check:plugins loaded both installed extension entries with Pi's
+  discoverAndLoadExtensions in a temporary empty agent directory. Output:
+  "Loaded 2 pinned Pi extensions: .../pi-continuity/extensions/index.ts,
+   .../pi-better-web-search/extensions/index.ts".
+  This is an extension-loader smoke test, not a real Pi Worker session and not a model call.
+
+VERIFIED PI API BOUNDARIES
+- createAgentSession and session.bindExtensions are exported by the published 1.4.0 SDK.
+- context_with_system fires before each provider request and its returned messages are used for
+  that request only. before_agent_start is per run, so Memory freshness must use
+  context_with_system.
+- agent_settled is the final-idle signal after automatic retries/queues; agent_end is not.
+- Pi exposes native read/write/edit operation interfaces and native tool factories; the Worker
+  contract specifies routing managed absolute paths to the document broker there.
+- No assertion is made that the installed SDK was built from ./pi.
+
+PUBLIC CONTRACT INVENTORY (rsi/src/shared)
+- config.ts: parseRsiConfig, loadRsiConfigFile, loadRsiConfigFromEnv, RsiConfig,
+  RsiConfigInput, RsiIpcConfig, RsiSandboxConfig.
+- paths.ts: RuntimePaths, RuntimePathInput, deriveRuntimePaths, assertRuntimePathPolicy,
+  isPathWithin, requireAbsolutePath, MEMORY_FILENAME, INDEX_FILENAME,
+  SANDBOX_IPC_SOCKET_PATH.
+- layout-verify.ts: verifyRuntimeLayout, VerifiedRuntimeLayout, CanonicalProtectedPath.
+- words.ts: countWords, evaluateWordLimit, assertWordLimit, WordLimitResult.
+- time.ts: Clock, SystemClock, formatTimestamp, formatLogTimestamp,
+  formatCurrentTimeSuffix, currentTimeSuffix, parseWallClock, normalizeWallClock,
+  parseZonedDateTime, getZonedParts, getTimeZoneOffsetMs, DEFAULT_TIME_ZONE.
+- sleep.ts: SLEEP_TOOL_NAME, parseSleepDuration, parseSleepRequest,
+  computeSleepDeadline, SleepRequest, SleepDeadline, SleepState, createSleepState,
+  isSleepDue, assertExplicitSleepState.
+- errors.ts: RsiError, RsiErrorCode, RsiErrorPayload, asRsiError, toRsiErrorPayload,
+  rsiErrorFromPayload.
+- documents.ts: INDEX_COLUMNS, parseMarkdownIndex, auditIndex, formatIndexWarning,
+  renderIndexReadReport, validateManagedDocumentWrite, DocumentCommitRequest,
+  DocumentMutationResult, ManagedDocumentStat, ReadStatRecord.
+- managed-path.ts: MANAGED_DOCUMENT_NAME_PATTERN, assertManagedDocumentName,
+  inspectManagedMarkdownPath, listManagedMarkdownNames.
+- memory.ts: MEMORY_MAX_WORDS, MemorySnapshot, MemoryValidation, formatMemoryUsage,
+  validateMemoryContent, evaluateMemoryUpdate, createMemorySnapshot.
+- memory-context.ts: MEMORY_SYSTEM_SECTION, injectMemoryAtRequestBoundary,
+  RequestBoundaryMemorySource.
+- plugins.ts: VerifiedPluginPin, REQUIRED_PLUGIN_PINS, REQUIRED_PLUGIN_SPECS,
+  VERIFIED_PI_SDK_DEPENDENCIES, assertInstalledPluginManifest,
+  resolveInstalledPluginExtension, PluginCandidate, LkgSnapshot.
+- preflight.ts: ImmutableCandidate, PreflightReport, ReloadHealthState,
+  HealthTurnObservation, classifyHealthyTurn, advanceHealthTurns,
+  PluginGenerationState, assertCandidateDigest, WatchdogState, isHeartbeatExpired,
+  HEALTHY_TURNS_REQUIRED, PREFLIGHT_MOCK_LOAD_TIMEOUT_MS.
+- sandbox.ts: SandboxPolicy, SandboxLaunchRequest, SandboxHandle, SandboxLauncher,
+  createSandboxPolicy, ProtectedPath, SandboxMount, SandboxPreflightReport.
+- tool-result.ts: composeToolResultSuffix, appendToolResultText,
+  decorateToolResultContent, hasCurrentTimeSuffix, stripTrailingCurrentTime.
+- policy.ts: fixed limits MEMORY_MAX_WORDS=500, MANAGED_DOCUMENT_MAX_WORDS=1000,
+  MAX_MANAGED_DOCUMENTS=20, MAX_MCP_SERVERS=5, MAX_SKILLS=5,
+  HEALTHY_TURNS_REQUIRED=3, PREFLIGHT_MOCK_LOAD_TIMEOUT_MS=3000,
+  heartbeat/IPC defaults, FORBIDDEN_AGENT_CONTROL_COMMANDS, AGENT_PROMPT_POLICY,
+  assertAgentPromptAllowed, assertResourceCaps.
+- ports.ts: MemoryPort, DocumentStorePort, NativeToolOperationsPort,
+  ToolMiddlewarePort, ToolResultDecorationPort, PreflightPort, SnapshotStorePort,
+  WorkerLifecyclePort, WatchdogPort, AutonomousLoopPort, SleepGatePort,
+  CommandControlPort, HealthTurnPort, WorkerStatusPort, SupervisorDependencies,
+  WorkerBootstrapDependencies.
+- events.ts: RuntimeEventMap, RuntimeEventPublisher, RuntimeEventSubscriber,
+  RuntimeEventBus.
+- ipc/protocol.ts: all request/response/event maps and frames, validation,
+  requestFrame, responseFrame, errorResponseFrame, eventFrame, request ids.
+- ipc/codec.ts: encodeIpcFrame, decodeIpcLine, IpcFrameDecoder.
+- ipc/queue.ts: BoundedIpcOutboundQueue, IpcOutboundWriter, IpcWrite.
+- ipc/port.ts: WorkerIpcClient, SupervisorIpcClient, WorkerIpcServer,
+  SupervisorIpcServer, IpcRequestContext, assertIpcDirection.
+
+IPC METHOD COVERAGE
+Worker -> Supervisor:
+  memory.current, docs.list, docs.read, docs.commit, docs.indexReport,
+  docs.consistency, reads.record, tools.decorateResult, sleep.request,
+  sleep.status, health.turn, heartbeat, reload.preflight, reload.started,
+  reload.failed.
+Supervisor -> Worker:
+  control.reload, control.shutdown, control.cancelSleep, worker.status,
+  worker.ping.
+Events:
+  worker.ready, worker.stopping, sleep.entered, sleep.woke, reload.completed,
+  memory.changed, docs.changed, sleep.wake, watchdog.rollback.
+Every request/response carries requestId; every event carries eventId. Frames are LF-NDJSON
+over a Unix socket, never stdout. Frame and queue limits exist; queue exhaustion is an explicit
+IPC_BACKPRESSURE error.
+
+DIRECTORY CONVENTIONS
+- rsi/src/shared/: this foundation and its exports.
+- rsi/src/supervisor/: later trusted process, state, broker, IPC server, config.
+- rsi/src/worker/: later Pi SDK Worker and extension wiring.
+- rsi/src/knowledge/: later document broker/index/read-stat implementation.
+- rsi/src/sandbox/: later bwrap launcher/alias verification.
+- rsi/src/preflight/: later static syntax, 3s mock load, snapshots, Watchdog.
+- rsi/src/loop/: later autonomous loop and explicit sleep gating.
+- rsi/src/control/: later Supervisor command control.
+- rsi/src/integration/: later main entry composition.
+- rsi/test/: foundation tests. rsi/reports/: this handoff and pending checks.
+- Runtime data defaults: <data>/markdowns/{Memory.md,index.md,*.md}; external state is
+  <state>/{snapshots,control,run,plugins,read-stats,sleep.json,watchdog.json,logs}.
+
+COMMANDS AND RESULTS
+- npm install --ignore-scripts --no-audit --no-fund: success.
+- npm run check:types: success (standalone tsc --noEmit).
+- npm test: success, 43/43 tests.
+- npm run check:plugins: success, 2 pinned extensions loaded.
+- npm run check: success, includes typecheck, tests, and plugin load; output ended
+  "rsi foundation checks passed."
+- No real model call was made.
+
+ROOT MARKDOWNS
+- markdowns/architecture.md: 998 words under the package's countWords algorithm,
+  development/operations document, not a prompt.
+- markdowns/index.md: exact three-column index; lists architecture.md, itself, and Memory.md.
+- markdowns/Memory.md: intentionally empty (0 words), counts in the 20-document quota.
+- The repository index is internally consistent; no sample system prompt exists.
+
+PENDING REAL LINUX VERIFICATION (not implemented or not testable on this host)
+1. bubblewrap actual mount behavior: read-only canonical aliases for Pi, RSI, manual prompt,
+   and markdowns; hidden external state/snapshots/control; isolated /proc; capability drop;
+   distinct Worker uid; fs.protected_hardlinks=1; fail-closed preflight checks.
+2. Prove bash and extension direct filesystem writes cannot alter managed Markdown, including
+   symlink/hardlink alias attempts. The design states the intentional limitation that arbitrary
+   *.md outside markdowns remains possible under broad disk permission and is not atomically
+   prohibited; no watcher is claimed as enforcement.
+3. Unix-socket IPC under load: plugin console.log polluting stdout must not affect protocol;
+   frame-size limits, request ids, backpressure, timeouts, disconnect cleanup.
+4. Real Pi Worker session: createAgentSession + bindExtensions with the pinned extensions;
+   context_with_system Memory refresh within one tool loop; native read/write/edit routing to
+   broker; read(index.md) dynamic report; tool result decoration on every result.
+5. Reload path: isolated static syntax check, 3-second Mock load, failure returned as a tool
+   error, successful reload, exactly 3 consecutive healthy agent_settled runs, external LKG
+   creation, Watchdog rollback on crash/hang/missed heartbeat, candidate digest immutability.
+6. Sleep gating with absolute times in non-UTC zones including DST gaps/overlaps, and 24-hour
+   soak behavior. Sleep/plugin generation/LKG persistence must remain Agent-unwritable.
+7. Docker/Linux integration of the eventual main entry; current checks ran on Windows MINGW.
+
+SECURITY NOTES
+- Tool hooks are not treated as an OS sandbox.
+- No extra network/disk allowlist was added; broad container disk/network remains as required.
+- The manual prompt is external and fail-closed; no prompt content is generated by this package.
+- MCP and Skill limits are 5 each with Pi's native discovery; no stance prompt is added.

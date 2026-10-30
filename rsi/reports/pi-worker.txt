@@ -1,0 +1,237 @@
+HISTORICAL REPORT: claims about pi_control, Agent reload and Agent-authored Pi tools are superseded; see markdowns/architecture.md.
+
+INTEGRATION UPDATE: rsi/src/main.ts now wires the Worker to the external Supervisor IPC,
+control.request, runtime.turn, typed agent lifecycle/exception events, deploy-time candidates,
+real session.reload after external preflight, token-based health recovery and LKG. See
+rsi/reports/integration.txt. The "REQUIRED CONTRACT / INTEGRATION CHANGES" section below is
+historical; those items are implemented or intentionally covered by the integration entry.
+
+RSI-AGENT PI WORKER HANDOFF (plain text, not a prompt)
+Scope: rsi/src/pi/**, rsi/test/pi/**, rsi/reports/pi-worker.txt
+Host: MINGW64_NT (Windows), Node 24.16.0, npm 11.13.0
+Status: implemented and tested against the installed, published Pi SDK 1.4.0
+No pi/ file was modified. No Agent prompt content was added. No commit was made.
+
+FILES
+src/pi/worker.ts                 PiWorker lifecycle, AgentSession creation/persistence,
+                                 extension binding, reload preflight, health, heartbeat,
+                                 session replacement, approved resource set.
+src/pi/worker-types.ts           Public Worker service surface and IPC-backed adapters.
+src/pi/rsi-extension.ts          The single RSI Pi extension: native tool registration,
+                                 request-boundary Memory, tool-call middleware, finalized
+                                 tool-result coverage, sleep and pi_control tools.
+src/pi/request-context.ts        context_with_system Memory refresh and request sleep gate.
+src/pi/tool-result-finalizer.ts  message_end / nested tool_result finalization and metadata.
+src/pi/managed-tools.ts          Native read/write/edit operations routed to the document
+                                 broker only for direct managed Markdown children.
+src/pi/control-guard.ts          Public binding wrapper forbidding active-agent control.
+src/pi/control-ipc.ts            Trusted Supervisor control.reload/shutdown/cancelSleep/status/ping.
+src/pi/resource-loader.ts        Native discovery plus an approved-only extension set and
+                                 independent Skill-cap enforcement.
+src/pi/mcp-cap.ts                Native MCP config merge and pre-connection MCP cap.
+src/pi/sleep.ts                  Explicit sleep tool, deadline wait, cancellation, wake events.
+test/pi/helpers.ts               In-memory external services, faux providers, mock fetch.
+test/pi/*.test.ts                Real SDK/faux-provider integration tests.
+
+REAL PI SDK APIS VERIFIED FROM THE INSTALLED PACKAGE
+- createAgentSession, AgentSession.bindExtensions, AgentSession.reload,
+  AgentSession.prompt, AgentSession.subscribe, AgentSession.waitForIdle,
+  AgentSession.setModel/setThinkingLevel/cycleModel, AgentSession.dispose.
+- SessionManager.create/open/inMemory/getSessionFile/buildSessionContext.
+  A real persisted JSONL session was reopened in the test suite.
+- Extension API: on("context_with_system"), on("message_end"), on("tool_call"),
+  on("tool_result"), on("agent_end"), on("agent_settled"), on("resources_discover"),
+  on("session_start"), registerTool, registerCommand, getMcpServers/registerMcpServer.
+- Native tool factories and operation ports:
+  createReadToolDefinition/createWriteToolDefinition/createEditToolDefinition,
+  ReadOperations/WriteOperations/EditOperations, native bash, image reads,
+  truncation, details, usage, structuredContent and machine isError are preserved.
+- createMcpExtension plus the pinned 1.4.0 dist/extensions/mcp/config.js
+  loadMcpConfig for global/project merge and trust. This is an internal but
+  version-pinned path because loadMcpConfig is not exported.
+- DefaultResourceLoader with noExtensions=true, approved additionalExtensionPaths,
+  global/project/package/discovered skills, context files and inline factories.
+- Fallback stream only in tests: @earendil-works/pi-ai fauxProvider and mock fetch.
+  No paid token or real provider call was made.
+
+PINNED PLUGINS ACTUALLY LOADED
+- npm:pi-continuity@0.3.1 -> node_modules/pi-continuity/extensions/index.ts
+- npm:pi-better-web-search@0.1.5 -> node_modules/pi-better-web-search/extensions/index.ts
+- Both are resolved from the installed npm package, not a same-named GitHub tree.
+- npm run check:plugins loads both with Pi's discoverAndLoadExtensions.
+- The Worker also verifies both mandatory entry paths are present after load; a
+  missing/erroring approved extension fails startup explicitly. The exact
+  "mandatory package deleted" case is covered by code, not by deleting npm state.
+
+MEMORY AT EVERY PROVIDER REQUEST
+- The RSI extension subscribes to context_with_system and calls the external
+  MemoryPort on every request. It uses injectMemoryAtRequestBoundary from shared:
+  one leading system message, latest content in the named "memory" section,
+  all later system messages folded/replayed by getCurrentSystemMessage.
+- The provider payload is captured by the faux provider, not by helper strings.
+  Tests prove: same-run tool update -> next provider request contains the new
+  Memory in system position; old Memory is absent; the human prompt marker is
+  replayed once and unchanged; empty Memory removes the old content; a native
+  retry request contains Memory that changed after the first attempt.
+- Memory is never inserted as user/assistant/tool history. Assistant tool-call
+  arguments can contain text the model wrote, but no injected Memory message is
+  added outside system.
+- before_agent_start is not used for Memory. Reload/continuation/compaction paths
+  all reach the same context_with_system hook. Compaction-triggered summary calls
+  themselves were not separately measured.
+
+TOOL RESULT FINALIZATION
+- Top-level tool results are finalized in message_end for role toolResult. This is
+  necessary because Pi's unknown-tool, argument-validation, blocked and aborted
+  immediate outcomes do not reach tool_result/afterToolCall.
+- Nested calls are finalized in tool_result and keep details, structuredContent
+  and usage. Their finalized content is recorded and visible to the parent.
+- Because the current payload uses content replacement, tool_result for top-level
+  calls does not rewrite content; message_end preserves usage/details/nestedCalls/
+  durationMs/isError and appends a text block after images.
+- Decoration is exactly once, keeps images, and uses the shared order:
+  index report, Memory usage (only on a successful Memory update), index warnings,
+  then (Current Time: YYYY/MM/DD HH:mm:ss) at call end.
+- Tests cover native read/write/edit/bash, a mounted custom tool, web_search,
+  sleep, pi_control, a nested read, unknown tool, validation failure, blocked
+  call, image result, truncation details, custom usage/details/structuredContent,
+  and index warning on every result. read(index.md) report is model-visible and
+  the on-disk index is unchanged; read counts are recorded externally.
+
+MANAGED KNOWLEDGE
+- The native definitions remain in use. Only managed direct *.md children of
+  markdownsDir are routed to DocumentStorePort; ordinary files use local fs.
+- Memory.md writes go through docs.commit with revision CAS; the Memory usage
+  suffix appears only on the Memory write result and the next request sees it.
+- read(index.md) fetches the broker view through read operations; the decoration
+  service adds words/mtime/24h reads at request time and never writes them back.
+- Knowledge files are read-only only by the OS/bwrap layer; this Worker does not
+  claim tool hooks are an OS sandbox. bash and extension raw fs are not mediated.
+
+SLEEP AND CONTROL
+- sleep accepts exactly one of duration (s/m/h positive integer) or until
+  (YYYY/MM/DD HH:mm:ss). Both/neither/zero/fraction/past are validated.
+- The tool requests the external SleepGate, waits with timers, emits sleep.entered/
+  sleep.woke, and returns a model-visible result. context_with_system checks the
+  external sleep status again before every provider request, covering the native
+  automatic tool loop, continuation and queued follow-up. Heartbeat is an
+  independent interval and continues while sleeping.
+- Tests assert there is no early provider call for the tool sleep or for an
+  externally active sleep, and that a retry/continuity run settles only once.
+- SessionControlGuard patches the public AgentSession methods and the bindings:
+  setModel, setThinkingLevel, cycleModel, shutdown and session replacement
+  commands are unavailable to active extensions/agents. Tests exercise those API
+  calls through a real extension and verify AGENT_COMMAND_FORBIDDEN and unchanged
+  model/thinking. Normal extension commands and native tools remain registered.
+- pi_control supports status and forwards reload as a request to an injected
+  external RuntimeControlPort; it does not call session.reload inside the active
+  run. shutdown/cancel_sleep are rejected for the active agent.
+- Every reload entry exercised reaches worker.requestReload -> external
+  reload.preflight -> external reload.started -> real session.reload:
+  extension command context reload, direct session.reload, and trusted IPC
+  control.reload. New extension tools registered by the approved replacement
+  become active and callable. A failed preflight does not run session.reload.
+
+RESOURCE DISCOVERY AND CAPS
+- The ResourceLoader wraps native DefaultResourceLoader. noExtensions=true and
+  approved additional extension paths prevent global/project/package extension
+  directories from bypassing the approved immutable set. Skills/prompts/themes/
+  context files still follow native global/project/package/discovered discovery.
+- Skills are counted from the final discovered Skill objects, not a settings array.
+  Tests cover global, trusted project, a local package manifest, and
+  resources_discover. Five load; a sixth fails startup without slicing. Untrusted
+  project skills are not loaded.
+- MCP config uses Pi's native global/project merge and trust. Config + dynamic
+  registrations are counted as one namespace before activation. Five start; six
+  are an explicit RESOURCE_CAP_EXCEEDED. pi.registerMcpServer is capped before
+  registry mutation/connection; a sixth returns an error and the registry stays 5.
+- The built-in MCP extension factory (createMcpExtension) is included along with
+  codemode/tool_search, preserving the native MCP initialization path. Tests use
+  disabled HTTP servers, so no real MCP transport/auth is exercised.
+
+HEALTH, SETTLEMENT, TELEMETRY
+- session.subscribe distinguishes agent_end from agent_settled. Health is recorded
+  only at agent_settled via the awaited extension handler, with assistant count,
+  stopReason and aborted. Native retry and pi-continuity continuation each produce
+  one health turn and one agent_settled; agent_end is not treated as final idle.
+- run() refuses to start while a previous run/retry/continuity settlement is active.
+  Tests verify a single external prompt produces two provider requests but one
+  settlement and one health turn.
+- Heartbeat reports sequence/pid/generation/state/healthTurns/memoryRevision and
+  keeps running during sleep. Exceptions go to an optional telemetry sink; the
+  Supervisor contract still needs an external event/method for them.
+- A replacement AgentSession is rebound through replaceSession: guard, health
+  listener, decoration and extension bindings are reinstalled; test verifies.
+
+VERIFIED TEST RESULTS
+- npm run check:types: pass.
+- npm test: 69/69 pass across 21 test files.
+- npm run check:plugins: loads exactly the two pinned npm extensions.
+- npm run check: pass, ending "rsi foundation checks passed."
+- Tests use only faux providers and mocked fetch; no real API key/token.
+
+INTEGRATION EVENTS, PORTS AND LOADING PATHS
+- Worker services expected from integration:
+  memory.current, docs.*, reads.record, tools.decorateResult, sleep.*,
+  reload.preflight/started/failed, health.turn, heartbeat; Worker IPC events
+  worker.ready/stopping, sleep.entered/woke, reload.completed.
+- bindWorkerControlIpc wires trusted control.reload (still preflighted), shutdown,
+  cancelSleep, status and ping. Call it with the real WorkerIpcServer.
+- startWorker/requestReload accepts the externally approved extension path list.
+  The integration must derive it from the preflighted immutable candidate before
+  calling requestReload; the shared control.reload payload does not carry it.
+- MCP merge uses a pinned internal SDK module path. If the SDK is upgraded, export
+  or replace loadMcpConfig or this import must be updated.
+- Tool results are finalized at message_end. Do not add another content-decoration
+  service that appends the same suffix; the finalizer replaces a trailing time
+  line but cannot undo arbitrary duplicate metadata from another handler.
+
+REQUIRED CONTRACT / INTEGRATION CHANGES (not applied; shared files untouched)
+1. Add a Worker->Supervisor command request method (for example control.request)
+   and a production RuntimeControlPort implementation. pi_control reload currently
+   has nowhere to send the request over the shared Worker->Supervisor map.
+2. Add external WorkerToSupervisor events for agent_end, agent_settled and
+   exception/fatal diagnostics. Current shared events do not carry them; only
+   health.turn at settlement and heartbeat state are available externally.
+3. Add a supported MCP registry cap hook (or a createMcpExtension cap option).
+   The current implementation patches runtime.mcpServers.register; it is a real
+   runtime object but not a documented extension API.
+4. Export the pinned SDK MCP config loader, or add a public MCP config type/loader
+   port, so production does not depend on dist/extensions/mcp/config.js.
+5. Carry approved extension paths/digests in the preflight/control reload
+   payload, or let the integration set them through a supported Worker API.
+6. Add a WorkerIpcClient subscription for Supervisor->Worker events (sleep.wake
+   and a future exception/control directive). The shared client only exposes
+   request/sendEvent, so control.cancelSleep is the currently usable path.
+7. Consider adding request time/tool input to ToolResultDecorationRequest. The
+   Worker currently composes the canonical local order and trusts appendText only
+   when supplied; remote report/warning data are used as returned.
+
+NOT VERIFIED HERE (environment or scope limits)
+- Actual bubblewrap mounts, read-only canonical aliases, masked state/control,
+  distinct Worker uid/gid, fs.protected_hardlinks=1, isolated /proc and bwrap
+  argv execution. Source policy and launcher are outside this scope.
+- Actual Unix-socket IPC transport, frame limits, backpressure, disconnect cleanup
+  and stdout/stderr pollution under plugin console logging. Tests use in-memory
+  fake services and validate that the Worker never transports protocol on stdout.
+- Real MCP server connections, OAuth, stdio/HTTP transports and resource tools;
+  tests use disabled config entries and a dynamic registry cap.
+- npm-registry installation of a package-provided Skill. The test uses the native
+  local-package source path with a real package.json/pi.skills manifest.
+- Paid/real model and web-search providers. web_search is exercised through the
+  real pinned plugin against a mock OpenAI Responses SSE endpoint.
+- Compaction summary requests themselves and long-running DST sleep soaks.
+- The exact two mandatory npm packages being absent from node_modules. The Worker
+  fails closed on missing/erroring approved extensions and verifies pinned entry
+  resolution; package deletion was not performed destructively.
+- Real read-stat/file-mtime persistence: tests use an external in-memory document
+  service that mirrors the shared protocol; production integration must implement
+  reads.record/docs.indexReport.
+
+NO PROMPT OR SANDBOX CLAIM
+- No system/personality/example prompt was written. The only prompt text in tests
+  is a marker fixture used to prove the human-provided prompt is replayed verbatim.
+- Tool descriptions are the minimum native/tool schemas required to call the two
+  RSI tools; no MCP/Skill stance or encouragement prompt was added.
+- Tool hooks are not an OS security boundary. The Worker trusts bwrap and the
+  external broker/uid separation for filesystem enforcement.

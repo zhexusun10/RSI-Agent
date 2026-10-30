@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "okx-demo": {
+      "exposure": "direct",
+      "command": "npx",
+      "args": [
+        "--yes",
+        "@okx_ai/okx-trade-mcp@1.5.0",
+        "--demo",
+        "--profile",
+        "demo",
+        "--modules",
+        "market,account,spot"
+      ],
+      "description": "OKX simulated trading and market data; requires a demo-only profile."
+    }
+  }
+}

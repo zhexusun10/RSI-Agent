@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+.artifacts/
+*.tsbuildinfo
+*.log
+.rsi/
+.env
+secrets/

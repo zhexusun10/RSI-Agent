@@ -1,0 +1,94 @@
+RSI-Agent: ClinePass and OKX demo setup
+
+On Linux, from rsi/ copy deploy/rsi.env.example to .env. Set
+RSI_SYSTEM_PROMPT_FILE to the absolute host path of rsi/system-prompt.txt,
+and set CLINE_API_KEY to a valid ClinePass key. Do not commit or share .env.
+The supplied prompt is mounted read-only and Memory.md remains agent-writable
+through the Runtime broker. Run docker compose build, docker compose up -d,
+then docker compose ps and docker compose logs --tail 100 rsi.
+
+A new data volume receives deploy/cline.models.json, selecting provider cline
+and model cline-pass/deepseek-v4.1-flash. The selected model must exist; it
+never silently falls back. The ClinePass key is forwarded into the Worker and
+is therefore accessible to the model through shell commands. Docker administrators
+can inspect the container environment, and bubblewrap process arguments can expose
+the key to privileged host/container observers. Restrict Docker and process access.
+Revoke and rotate any key exposed in a conversation, log or untrusted location.
+
+For optional real-API Docker/bubblewrap smoke tests, from the project root set
+CLINE_API_KEY in the environment and run `node rsi/scripts/live-cline-smoke.mjs`.
+Set RSI_SMOKE_SANDBOX=1 to also attempt and verify denied direct writes to Pi,
+Runtime, prompt, and Memory, plus an allowed workspace write, in the isolated container.
+To additionally exercise the model calling official read-only OKX demo MCP
+public market data, run `node rsi/scripts/live-okx-market-smoke.mjs`.
+Cline API calls may incur charges. The scripts' separate temporary containers and
+volumes are removed on normal completion; neither test needs OKX credentials or
+places trades.
+
+A pre-existing /data/pi-agent/models.json is NOT overwritten. To migrate,
+stop the service, back up both volumes, and merge the cline provider from
+/opt/rsi/deploy/cline.models.json into that file as the operator. Because the
+state volume records an integrity baseline, after reviewing the changes the
+operator must remove ONLY /state/runtime/operator-pi-config.json while the
+service is stopped; the next start captures the new baseline. Do not remove the
+data or state volumes just to configure a provider. Restart and check logs.
+
+pi-better-web-search hides web_search unless a supported search provider is
+also authenticated. ClinePass alone does not provide this plugin's search API.
+Provide, for example, a separate DEEPSEEK_API_KEY or GEMINI_API_KEY in .env.
+No search key is included and the runtime does not simulate search results.
+
+For OKX, create separate credentials in the OKX SIMULATED TRADING interface,
+with read/trade permissions as required and NO withdrawal permission. Never
+provide real-account API keys. Install the official MCP via Pi's native MCP
+configuration. deploy/okx-demo.mcp.json shows the server definition; merge it
+into /data/pi-agent/mcp.json or use `pi mcp add` inside the Worker. Store the
+demo profile in the Worker home at /data/worker-home/.okx/config.toml:
+
+  default_profile = "demo"
+  [profiles.demo]
+  api_key = "YOUR_DEMO_API_KEY"
+  secret_key = "YOUR_DEMO_SECRET_KEY"
+  passphrase = "YOUR_DEMO_PASSPHRASE"
+  demo = true
+
+Use restrictive file permissions and never commit this file. The Worker and
+model can read it. The explicit --demo flag enables simulated trading;
+--modules market --read-only is recommended for the first public
+market-data check. The sample enables spot orders and therefore should only be
+used after the operator has set up a DEMO account. Network/region availability
+and demo-key permissions must be verified independently.
+
+Neither --demo nor the system prompt is a security boundary: the model has
+shell/network access and can bypass the MCP or read its credentials. The Worker
+must never be given live trading credentials. Docker/bwrap protects runtime
+and Pi files, not finances, secrets from the model, strategy profitability, or
+external websites. Do not leave a paid or trading-enabled agent unattended
+until the entire demo flow and monitoring have been verified.
+
+On Windows Docker Desktop, use the explicit compose.windows.yaml overlay; it
+replaces the prompt bind mount with a read-only volume. From PowerShell in rsi/,
+after setting up .env as above and starting Docker Desktop:
+
+  docker compose --project-name rsi-agent -f compose.yaml -f compose.windows.yaml build
+  docker compose --project-name rsi-agent -f compose.yaml -f compose.windows.yaml create --no-build
+  Get-Content -Raw -Encoding UTF8 system-prompt.txt | docker run --rm -i --entrypoint node --mount type=volume,source=rsi-agent_rsi-prompt,target=/target rsi-agent:local -e "process.stdin.pipe(require('fs').createWriteStream('/target/system-prompt.txt'))"
+  docker compose --project-name rsi-agent -f compose.yaml -f compose.windows.yaml up -d
+  docker compose --project-name rsi-agent -f compose.yaml -f compose.windows.yaml ps
+
+Keep RSI_SYSTEM_PROMPT_FILE set in .env even when using the overlay (Compose
+interpolates it before applying the overlay). The prompt-volume command is for
+initial provisioning, not for changing a running agent's immutable prompt.
+The Linux-only acceptance harness cannot claim host-Linux coverage on Windows.
+Docker's real bubblewrap preflight still runs inside the Linux container and
+fails closed if unsupported.
+
+To provision the OKX demo profile and example MCP config offline on Windows,
+stop the service first (or do this after `create` and before `up`). Put the TOML
+above into rsi/secrets/okx-demo.toml locally; secrets/ is git-ignored. Then run:
+
+  Get-Content -Raw -Encoding UTF8 secrets/okx-demo.toml | docker run --rm -i --network none --entrypoint sh --mount type=volume,source=rsi-agent_rsi-data,target=/data rsi-agent:local -c "set -e; test ! -e /data/pi-agent/mcp.json || { echo 'Existing MCP config: merge manually' >&2; exit 1; }; umask 077; mkdir -p /data/worker-home/.okx /data/pi-agent; tee /data/worker-home/.okx/config.toml >/dev/null; chown -R 10002:10002 /data/worker-home/.okx; cp /opt/rsi/deploy/okx-demo.mcp.json /data/pi-agent/mcp.json; chown 10002:10002 /data/pi-agent/mcp.json"
+
+Do not overwrite an existing MCP config; merge the example as the operator. The
+example includes spot trading and should be activated only after demo credentials,
+permissions, risk limits, and monitoring have been verified.

@@ -1,0 +1,177 @@
+RSI-AGENT 独立验收 P1 IPC 身份修复报告
+
+日期：2026-10-27
+范围：仅修复 Supervisor/Worker IPC 身份认证与代际绑定，以及 Worker 启动时的专用凭据传递。
+未修改：pi/、src/pi/**、integration/reload-service.ts、reload/preflight-runner.ts、Docker/Compose/package/Markdown；未创建 commit；未写 Agent 系统提示词/人格/default prompt。
+
+一、结论
+
+本轮已修复验收报告 P1-1 的核心缺陷：
+- Supervisor 不再把任意可连接 Unix socket 当作 Worker，也不再让第二连接关闭或替换健康 peer。
+- Worker 首次连接必须在第一帧完成一次性 launch 身份认证；认证前不安装有副作用 handlers，不触发 onPeer，不接受 worker.ready。
+- 凭据与实际 spawn 绑定，重放、错误 token、错误 launchId/epoch、错误 generation 均失败；旧 launch 的 peer 在新 launch 时立即撤销，迟到 heartbeat/health/ready/reload/agent.settled 不能更新状态。
+- Supervisor 忽略 Worker 自报 pid；Watchdog 与健康状态使用 Supervisor 实际 spawn handle 的宿主 pid。bwrap 内 namespace PID 只用于 Worker 自身诊断，不参与握手比较。
+- 认证失败只关闭攻击连接，不关闭当前健康 peer；未认证连接有并发数量、帧大小、握手帧数和 deadline 上限。
+- 合法首次启动、reload、restart、长 sleep 心跳、broker/控制/工具路径继续通过相关回归。
+
+仍不能宣称“已攻陷 Worker 内部仍可信”：任何已加载进合法 Worker 的恶意扩展都可使用该 Worker 已认证的现有 channel 发送任意 worker-to-supervisor 消息。该限制见“威胁边界”。
+
+二、协议与实现
+
+1) 一次性 bootstrap 凭据（共享 IPC 身份协议）
+文件：src/shared/ipc/bootstrap.ts、src/worker-main.ts、src/sandbox/types.ts、src/sandbox/launcher.ts、src/sandbox/local-launcher.ts
+
+- 每次 spawn 生成新的 WorkerBootstrap：
+  - version=1
+  - launchId=UUID（每次启动/重启都不同）
+  - token=32 字节 CSPRNG，base64url 43 字符
+  - generation=本次启动期望的插件 generation
+- 凭据记录最大 2048 字节，格式严格校验，只允许一条 LF 记录。
+- 生产 bwrap 启动时使用子进程继承的 stdin 管道传递该记录，随后立即 EOF：
+  - 不写 argv
+  - 不写 Worker 环境变量
+  - 不写日志、health、reload 状态或可遍历文件
+  - Worker 在加载模型/插件之前读取并校验，随后 pause/destroy stdin；生产插件没有该环境变量可读。
+- 若自定义 SandboxLauncher 需要支持生产 Worker，必须把 SandboxExecutionRequest.bootstrapInput 写入子进程继承的 stdin；否则 Worker fail-closed。现有 BubblewrapSandboxLauncher 已实现。
+- LocalWorkerSandboxLauncher 仅用于本地/集成测试，也走同样的 stdin 契约；生产入口仍只创建 bwrap launcher，没有生产 TCP/unsandboxed fallback。
+
+2) 首帧认证握手
+文件：src/integration/ipc-transport.ts、src/shared/ipc/protocol.ts、src/shared/errors.ts
+
+- 新增 worker.authenticate 请求，payload 为 launchId/token/generation；返回 accepted/launchId/generation/serverTimeMs。
+- Supervisor 在 spawn 前调用 expectWorker() 登记当前唯一期望身份：
+  - token 使用 constant-time 比较；
+  - launchId、generation、过期时间必须完全匹配；
+  - 验证成功后立即消费凭据，响应写出前即失效，不能重放；
+  - 错误/缺失/过期/已消费/错误 generation 返回 IPC_AUTH_FAILED，只关闭该连接。
+- 认证前只允许第一帧 worker.authenticate；其他 request/event/response 直接拒绝并关闭该连接。
+- 认证前不把已有 handlers/events 注册到 peer；认证成功后才 promote，安装 handlers、设置 currentIdentity、唤醒 waiters、调用 onPeer。
+- 未认证 socket：
+  - 默认最多 8 个 pending；
+  - 首帧认证 deadline 默认 30 秒；
+  - 入站认证队列最多 256 帧，且每连接只接受一次成功认证；
+  - 帧仍受现有 maxFrameBytes 限制。
+- 新 expectWorker() 会同步撤销旧 launch 的 peer；旧 token 已消费/被替换，重放不能关闭新 peer。额外匿名/重放连接不会触碰健康 peer。
+- Worker 端 connect() 在返回前等待认证确认；失败关闭 socket，不继续加载 Worker runtime。
+
+3) 消息身份、generation/session 与 Watchdog PID
+文件：src/integration/runtime.ts、src/worker-main.ts、src/shared/ipc/protocol.ts
+
+- worker.ready：
+  - 必须来自当前已认证连接；
+  - payload generation 必须等于该 launch 的认证 generation；
+  - 每个 launch 只接受一次；
+  - Watchdog recordWorkerStarted 使用 this.workerHandle.pid，不使用 payload.pid；
+  - 重复/错误 generation 的 ready 不计数，错误 identity 会撤销该连接。
+- heartbeat：
+  - payload.workerPid 一律忽略并替换为实际 spawn handle 的宿主 pid；
+  - generation 必须等于当前 generation，或正在 reload 的目标 generation；
+  - sessionId 必须匹配当前 session，或处于已授权的 reload 过渡；
+  - 旧 generation 的迟到 heartbeat 不能把 generation/session 回退。
+- health.turn：
+  - 先做相同 generation/session 身份检查；
+  - 仍由 ReloadCoordinator 校验 attemptId/generation/turnIndex/连续健康轮，重放不能凑满 3 轮。
+- agent.settled：
+  - 认证连接 + 合法 generation/session 才可更新 Worker 状态；
+  - 错误/旧代际事件被忽略，不能回退 generation。
+- reload.completed：
+  - 只处理当前认证连接；
+  - 仍由 Coordinator 校验 attemptId、generation、digest、deadline；
+  - 旧 peer 在新 launch 时已被撤销。
+- Worker 侧 heartbeat 与 health.turn 由 worker-main 包装补充当前 sessionId；事件 sink 同步记录 ready/agent.settled 的 session。
+- 由于 Supervisor 使用 handle.pid，Linux bwrap 内 PID namespace 的 Worker PID 不再被拿来与宿主 launcher.pid 比较，不会出现“Linux 永远握手失败”。
+
+4) 保持合法路径
+- launchWorker 在 ready 超时、generation 不匹配或启动失败时终止已 spawn handle、清理期望身份并撤销该 launch 的 peer，避免遗留悬挂 Worker。
+- 合法 reload 期间的嵌套请求（Worker 处理 control.reload 时反向调用 reload.preflight）不被认证队列串行化阻塞；只有未认证阶段串行。
+- 仍保留 Watchdog 先唤醒 ready waiter 再入队 recordWorkerStarted 的顺序，未重新引入 waitForReady/Watchdog 队列死锁。
+
+三、文件变更
+
+新增：
+- rsi/src/shared/ipc/bootstrap.ts
+- rsi/src/sandbox/local-launcher.ts（本地/集成测试 launcher，生产不使用）
+- rsi/test/acceptance/supervisor-ipc-authentication.test.ts
+- rsi/reports/repair-ipc.txt
+
+修改：
+- rsi/src/shared/ipc/protocol.ts
+- rsi/src/shared/errors.ts（新增 IPC_AUTH_FAILED）
+- rsi/src/integration/ipc-transport.ts
+- rsi/src/integration/runtime.ts
+- rsi/src/worker-main.ts
+- rsi/src/sandbox/types.ts
+- rsi/src/sandbox/launcher.ts
+- rsi/test/acceptance/supervisor-ipc-unauthenticated.test.ts
+- rsi/test/integration/helpers.ts（改用支持 stdin bootstrap 的本地测试 launcher）
+
+四、回归与执行结果
+
+环境：Windows MINGW64_NT-10.0-26300，Node v24.16.0，npm 11.13.0；无 Linux/bwrap/Docker。测试全部使用 faux/test model，没有付费 API。
+
+已执行：
+1) cd rsi && npm ci --ignore-scripts
+   成功；未执行安装脚本。
+
+2) cd rsi && npm run check:types
+   EXIT 0。
+
+3) cd rsi && npm run check:plugins
+   EXIT 0；实际加载两个固定插件。
+
+4) cd rsi && npm run check
+   tests 272, pass 253, fail 11, skipped 8, duration_ms 48001.8668, EXIT 1。
+   新增 IPC 回归全部通过；相对验收报告 12 个失败减少为 11 个，原 supervisor-ipc-unauthenticated 已修复。
+   8 个 skip 仍是 Linux bwrap/mount/PID/文件系统条件，未在本机执行。
+
+5) 定向通过：
+   - test/acceptance/supervisor-ipc-authentication.test.ts（2/2）
+     * 一次性凭据只绑定一个 peer；
+     * 错误 token、错误 generation、重放失败；
+     * 额外连接不能关闭健康 peer；
+     * 新 launch 撤销旧 peer，旧 token 不能重放；
+     * 认证 deadline 只关闭静默未认证连接，合法 Worker 仍能认证。
+   - test/acceptance/supervisor-ipc-unauthenticated.test.ts（2/2）
+     * 未认证第二连接不能注入 heartbeat；
+     * 3 轮伪造 health.turn、伪造 heartbeat、reload.started/reload.failed、worker.ready/agent.settled/reload.completed 均不能改变 Watchdog pid/sequence、generation、active/LKG/health。
+   - test/integration/runtime-smoke.test.ts
+   - test/integration/runtime-reload-control.test.ts
+   - test/integration/runtime-crash-rollback.test.ts
+   - test/integration/runtime-sleep-restart.test.ts
+   上述合法启动/reload/LKG 崩溃恢复/长 sleep 心跳均通过。
+
+五、部署与跨模块接线要求
+
+1) SupervisorRuntime 必须在每次 spawn 前生成并登记新的 launchId/token/generation，并通过 SandboxExecutionRequest.bootstrapInput 交给 launcher；当前 runtime 已这样接线。
+2) 任何自定义/替代 SandboxLauncher 必须：
+   - 为 Worker 创建继承的 stdin 管道；
+   - 原样写入 bootstrapInput 后 EOF；
+   - 不得把 bootstrapInput 放入 env、argv、日志或持久文件；
+   - 不支持时必须让 launch 失败，不能回退到无认证连接。
+3) 现有 BubblewrapSandboxLauncher 已使用 stdin，无需新增 env/config。没有增加 capabilities、没有取消 unshare PID/IPC/UTS、没有放宽 namespace 或 protected mounts。
+4) Worker socket 仍为 Worker group 0660；认证不依赖 socket 权限。额外同 UID 客户端仍可连接，但必须无法通过首帧认证。
+5) Watchdog 现在从 runtime 收到宿主 spawn handle pid；不要再把 worker.ready/heartbeat payload.pid 写回 Watchdog。若单独重构 Watchdog，仍需保留独立 host pid 字段，避免回退到 namespace pid。
+6) 本修复不改变控制 socket、reload 协议、Memory/broker 或工具 metadata 的现有接线。
+
+六、威胁边界与未验证项
+
+已覆盖：
+- 外部或同 UID 额外客户端连接 socket、伪造 heartbeat/health/ready/reload/agent.settled；
+- 错误 launchId/epoch、错误 token、错误 generation、重放已成功凭据；
+- 未认证连接抢占、关闭或替换健康 peer；
+- 新 Worker/Watchdog 重启后旧 peer 的迟到消息；
+- 伪造 payload.workerPid 影响 Watchdog；
+- 错误 session 的 heartbeat/health 不能更新实际状态。
+
+准确限制：
+1) 一旦恶意代码已经作为合法 Worker 的扩展/插件运行，它可以复用 Worker 已认证的现有 IPC channel，发送任意 Worker-to-Supervisor 消息。本轮不声称能抵抗“已攻陷 Worker 内部”。3 轮健康与 LKG 可信度只建立在“外部进程不可伪造 Worker channel”上，没有增加独立外部观察者，不能把进程内健康自证升级为抗已攻陷 Worker 的证明。
+2) 若攻击者能 ptrace/读取 Worker 内存、注入 Worker 进程，或在凭据消费前读取其 stdin/进程内存，则可获得 launch 能力；这等同于攻陷 Worker，不在本修复可证明边界内。凭据不落 env/argv/日志/文件，但它存在于启动期进程内存，JS 不提供可靠内存清零。
+3) 未认证客户端仍可造成可用性干扰：占用 pending 握手槽（上限 8）或反复连接直到 30 秒 deadline。它们不能伪造状态或替换健康 peer；启动阶段若被持续占满，合法 Worker 会等待/失败并由既有启动失败路径处理，不会降级为无认证。
+4) 本轮未修改 Watchdog 自身的数据模型。runtime 已不再把 namespace pid 传给 Watchdog，但 test/acceptance/watchdog-pid-namespace.test.ts 直接构造 Watchdog 的独立 P0-7 单测仍失败；需要 Watchdog 单独保存 host pid 的后续修复。
+5) 未在真实 Linux 执行：bwrap 是否在所有目标发行版正确保留 stdin、真实 PID namespace 下 ready/heartbeat、同 UID preflight 子进程连接尝试、fd 遍历、seccomp/AppArmor、Docker build/up、24H 运行。本机无 bwrap/Docker/WSL，相关 Linux 测试 skip；不能把 Windows local subprocess 结果当作 Linux namespace/fd 安全通过。
+6) 完整套件仍有 11 个既有失败，均非本轮 IPC 身份修复范围：preflight executable、preflight stderr alias、provider guard 3 项、reload rejection loaded state、managed alias、sleep 重启 heartbeat、system section 注入、tool metadata 清洗、Watchdog namespace PID 单测。另有 P1-2 sleep 重启状态仍未修复；本轮只验证 sleep 正常/崩溃重启路径未因 IPC 改动回归。
+
+七、最终判定（仅限本轮 P1 IPC 身份缺陷）
+
+IPC 身份认证与 peer 抢占/伪造/重放缺陷：通过本轮新增与实际 Worker 子进程回归。
+生产验收仍需在真实 Linux root + bwrap 环境重跑并完成上述剩余 P0/P1；在完成前不能宣称整个系统“生产安全”或“已攻陷 Worker 仍可信”。

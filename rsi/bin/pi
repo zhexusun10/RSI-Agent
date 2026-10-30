@@ -1,0 +1,5 @@
+#!/bin/sh
+# Runtime PATH shim. The real installed Pi CLI is selected by RSI_PI_REAL_CLI.
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec node "$SCRIPT_DIR/pi.mjs" "$@"

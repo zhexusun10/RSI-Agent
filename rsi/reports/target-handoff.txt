@@ -1,0 +1,67 @@
+RSI-Agent 目标环境交接（本机开发收口）
+
+日期：2026-10-28
+结论：本机开发与回归完成；生产部署验收待可用 Linux/Docker 及显式 24h 执行。不是完全生产通过。
+工作树：HEAD 79e47c454cda8158fdacd339fe3a3894adac1b0b；未 commit/push；`pi/` 未修改。
+
+一、已证实功能与最终测试数
+
+- 类型检查 EXIT 0；插件检查 EXIT 0，实际加载 pi-continuity 与 pi-better-web-search 两个固定扩展。
+- 完整产品套件：98 个测试文件，330 tests / 312 pass / 0 fail / 18 skip / 0 todo，`npm run check` EXIT 0，最终 `rsi checks passed.`。
+- 18 个 skip 全部是 Linux/bwrap/namespace/Docker 目标条件，不当作通过。
+- 新增/部署定向：29 tests / 28 pass / 0 fail / 1 skip（真实 Linux bwrap）。
+- 此前独立阻塞与 review2 回归复跑：43/43 pass，0 fail，0 skip。
+- 已保留并通过：Memory 500/501 原子性与每请求 system、工具元数据/时间、index 1000/20/read 24h 统计、sleep/loop、IPC token/撤销/重放、reload/LKG/crash/hang 回滚、operator config 基线/只读、五篇 Markdown seed、命令/API/CLI 拒绝。
+- 统一预检：CLI、deployment wrapper、launcher、target harness 共用同一严格 probe；host `/proc` Worker UID/GID、namespace uid/gid、groups、CapEff=0、namespace/mount/UTS、protected_hardlinks/symlinks、timeout、bwrap setuid/`--disable-userns` 均失败关闭。
+- 生产入口 smoke 代码已接线：受测容器使用镜像默认 ENTRYPOINT，不使用 `--entrypoint node` 或 fakeSupervisor；覆盖 fresh seed、operator 配置、配置渲染、部署预检、Supervisor/bwrap/真实 Pi、本地 mock 原生 provider、health、TERM、同 volume 重启。
+- 本机 Markdown：5 篇；Memory 0、architecture 1000、index 103、operations 997、security 994 词，总计 3094；每篇 <=1000、总数 <=20，index 三列且 consistent。无生产 Agent prompt/人格。
+
+二、尚未验证（不得视为通过）
+
+- 真实 Linux root + 非 setuid bwrap：host namespace/UID/GID、mount/FD、CapEff、seccomp/AppArmor。
+- Docker build/up、镜像默认 ENTRYPOINT、healthcheck、正常 TERM、同 volume 容器重启。
+- GitHub Actions 实际运行结果（本机未 dispatch）。
+- 真实 provider/OAuth/MCP/web_search 网络与凭据；本机只有本地 mock，无付费调用。
+- 24h soak：未启动、未执行。`linux-soak.mjs` 明确是 target-harness soak（`productionEntrypoint: false`，使用 `--entrypoint node`），只能作为该 harness 的 24h 证据，不能冒充生产 ENTRYPOINT 24h。当前没有任何 24h 证据。
+
+三、目标前置条件
+
+- Linux 主机；可用 Docker daemon 与 build/run 权限。
+- 内核允许 user/mount namespace；非 setuid bubblewrap 且支持 `--disable-userns`；镜像内有 setpriv/newuidmap。
+- 宿主 `fs.protected_hardlinks=1`、`fs.protected_symlinks=1`。
+- Docker 接受 `rsi/deploy/seccomp-bwrap.json`；如启用 AppArmor，须允许 bwrap namespace/mount。
+- 目标机自备人工非空 `.txt` 系统提示词，并配置真实模型凭据/operator settings/models/auth。仓库不提供生产提示词或密钥。
+- 不要在目标机增加 privileged、docker.sock、宿主根、额外 Worker capabilities 或 unsandboxed fallback。
+
+四、准确运行路径与命令（仓库根目录）
+
+```sh
+docker build --file rsi/Dockerfile --tag rsi-agent:target .
+
+# 生产默认 ENTRYPOINT 有界验收（先跑这个）
+node rsi/scripts/linux-validation.mjs \
+  --mode docker --suite entrypoint --image rsi-agent:target --no-build \
+  --timeout-ms 900000 --report /var/tmp/rsi-entrypoint.json
+
+# Linux/bwrap/reload/LKG/sleep 目标 harness（调试用途，使用 --entrypoint node）
+node rsi/scripts/linux-validation.mjs \
+  --mode docker --suite target --image rsi-agent:target --no-build \
+  --timeout-ms 1800000 --report /var/tmp/rsi-target.json
+
+# 显式 24h（target harness soak，不是生产 ENTRYPOINT soak）
+node rsi/scripts/linux-soak.mjs \
+  --hours 24 --image rsi-agent:target --no-build \
+  --report /var/tmp/rsi-soak.json
+```
+
+也可用 `--suite all` 顺序运行 target 再 entrypoint；任一步非 0 都是失败，不是 skip。要求证据文件保留完整退出码/报告；本机因 Windows + Docker daemon 不可用只记录 blocked_environment，不再反复重跑不可能命令。
+
+五、边界与提醒
+
+- 同进程任意 JavaScript 边界：恶意代码一旦作为合法 Worker/插件运行，可复用已认证 IPC 伪造自身 health/reload/settled，也可通过反射/原型/内存改写绕过进程内 provider guard。3 轮健康与 LKG 是 Supervisor 对已认证 Worker 的观察，不是独立外部可信观察者，不能宣称“已攻陷 Worker 仍可信”。
+- 托管 Markdown 范围：仅 `/data/markdowns/` 下直接 `*.md` 受 broker 管理（1000 词/篇、总数 20、Memory 500、index 一致）。workspace、plugins、tools、workflows 中可存在不受管的 `.md`，没有全盘白名单。
+- operator config 首次基线会接受首次启动时的配置；生产应从已知安全配置启动。
+- MCP/Skill：各 5 上限的回归已通过；不鼓励也不批评使用 MCP/Skill，它们不构成安全证明。
+- 用户需自行提供人工提示词与模型凭据；无付费 API 自动化。
+
+最终状态：**本机开发与回归完成；生产部署验收待可用 Linux/Docker 及显式 24h 执行。**

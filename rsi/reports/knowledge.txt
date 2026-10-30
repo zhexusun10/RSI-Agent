@@ -1,0 +1,254 @@
+INTEGRATION UPDATE: the production Supervisor now opens KnowledgeService with RuntimePaths, serves docs/memory/read-stats over IPC, and the Worker read(index.md) path uses docs.readView. See rsi/reports/integration.txt.
+
+RSI-AGENT KNOWLEDGE MODULE HANDOFF (plain text, not a prompt)
+Generated: 2026-10-26T16:13:40Z
+Host used for validation: Windows MINGW64_NT, Node v24.16.0, npm 11.13.0
+Base commit inspected: 79e47c4
+Target: Linux Docker with Node >=22.19.0
+
+STATUS
+- Implemented the trusted-Supervisor Memory and Markdown knowledge module under
+  rsi/src/knowledge/** with tests under rsi/test/knowledge/**.
+- No commit was created. No pi/ file, no rsi/src/shared/ file, no markdowns/ file,
+  no package.json, and no package-lock.json was changed by this module.
+- No Agent prompt was written or rewritten. No non-empty Memory content, example
+  prompt, or artificial system prompt is created by this module.
+- No real paid model was called. No Pi extension is loaded in the Supervisor.
+  Pi is used only through published read/edit tool factories on safe in-memory
+  staging; tests use those factories directly, not an extension loader.
+
+FILES
+- rsi/src/knowledge/index.ts          barrel exports
+- rsi/src/knowledge/atomic-fs.ts      strict UTF-8 reads, staging, atomic rename,
+                                      process mutex, cross-process directory lock,
+                                      directory identity and state isolation
+- rsi/src/knowledge/index-audit.ts    three-column table parser, local-link
+                                      normalization, index audit and initial index
+- rsi/src/knowledge/path-policy.ts    managed/unmanaged path classification and
+                                      alias/nested/hardlink checks
+- rsi/src/knowledge/read-stats.ts     persistent rolling 24-hour read counters
+- rsi/src/knowledge/service.ts        MemoryPort + DocumentStorePort + broker
+- rsi/src/knowledge/native-tools.ts   Pi ReadOperations/WriteOperations/
+                                      EditOperations for managed paths only
+- rsi/src/knowledge/tool-result.ts    decoration port, middleware, finalizer
+- rsi/test/knowledge/*.test.ts        module tests
+- rsi/test/knowledge/helpers.ts       test-only fixture helper
+- rsi/reports/knowledge.txt           this report
+
+PUBLIC PORT USAGE
+- MemoryPort.readCurrentMemory(signal?) -> AuthoritativeMemorySnapshot.
+  Reads the committed file on every call. No in-process cache, no run cache,
+  no reload dependency, no fs.watch dependency. Returned fields include
+  name, content, words, maxWords, revision, version (same revision alias),
+  updatedAtMs, and usage.
+- MemoryPort.commitMemory({content, expectedRevision}, signal?).
+  Full read-verify-STAGE/verify-rename transaction under one lock. On any
+  validation error the old target bytes are untouched. Returns snapshot + usage.
+- DocumentStorePort.list() -> ManagedDocumentSummary[].
+- DocumentStorePort.read(name) -> raw ManagedDocumentSnapshot (no annotations).
+- DocumentStorePort.commit(DocumentCommitRequest) -> DocumentMutationResult.
+  expectedRevision=null means create only; replacing an existing file requires
+  its exact revision. Memory commits always include memoryUsage.
+- DocumentStorePort.indexReport(now) -> shared IndexReadReport/reportText.
+- DocumentStorePort.consistency() -> shared IndexConsistency.
+- DocumentStorePort.recordRead(name, at) -> rolling 24-hour count.
+- NativeToolOperationsPort from createManagedNativeToolOperations(service):
+  read, write, and edit operation objects. Every operation rejects paths outside
+  markdowns/. The write object has overwrite-latest native semantics; the edit
+  object remembers the revision read for that absolute path and commits with
+  compare-and-swap. The read object returns the request-time annotated index
+  view so Pi's own read offset/limit/truncation runs on that view.
+- ToolResultDecorationPort from KnowledgeToolResultService.decorate(request, now).
+  Audits the authoritative index on every call, returns Memory usage metadata and
+  canonical index warnings, and returns currentTime separately for the Worker's
+  single final Current Time decoration. For index reads it also returns the
+  request-time IndexReadReport in indexReport; includeIndexReport (default false)
+  controls whether that table is duplicated into appendText. Per-row metadata is
+  already present in the managed read view.
+- ToolMiddlewarePort from KnowledgeToolMiddleware. beforeToolCall allows; after
+  every tool result it re-audits the index, strips stale standalone Runtime
+  metadata, and appends one canonical index warning if inconsistent.
+- ToolResult finalizer: finalizeKnowledgeToolResult preserves content blocks,
+  isError, details, structuredContent, and usage; strips old standalone Runtime
+  metadata; appends knowledge metadata/warnings and exactly one Current Time.
+- Extra broker methods: overwriteLatest, replaceDocument, editDocument (native Pi
+  edit semantics under the broker lock), deleteDocument, renameDocument,
+  annotateIndexContent, readManagedDocument, readBytesForNativeRead,
+  readBytesForManagedTool, resolveManagedToolPath, auditIndex,
+  readStatsCounts. These are explicit document operations only; there is no
+  arbitrary host write or bash bridge.
+- Helpers: classifyManagedToolPathAgainstRoot, inspectManagedToolPath,
+  assertManagedDirectoryRoot, KnowledgeService.open, openFromRuntimePaths.
+
+MEMORY AND DOCUMENT RULES
+- Memory.md: 500 shared-algorithm words. All other managed .md: 1000 words.
+  Total direct managed .md files: 20, including Memory.md and index.md.
+- Empty Memory.md is created only when missing. Existing over-limit, non-UTF-8,
+  NUL-containing, symlink, hardlink, non-regular, nested, invalid-name, or
+  over-quota startup state fails closed before creating or truncating anything.
+- A successful Memory change returns exactly:
+  [System Meta: Current Memory Usage: N / 500 words]
+  This line is a tool-result metadata line, never part of Memory.md bytes.
+- Every write/delete/rename/commit verifies: managed name, flat direct child,
+  strict UTF-8, NUL/unpaired-surrogate rejection, word cap, file quota, target
+  nlink=1, no symlink, no path escape, expected revision, and stable markdowns
+  directory identity. Content is written to a same-directory staging file,
+  read back and validated, then committed with rename. The staging file is
+  removed on every failure path.
+- Process-level mutex plus a state-area cross-process directory lock serializes
+  read-modify-verify-commit. Concurrent create or edit yields one winner and an
+  explicit DOCUMENT_REVISION_CONFLICT / MEMORY_REVISION_CONFLICT for the loser.
+- deleteDocument and renameDocument reject Memory.md/index.md, reject nested or
+  cross-directory target names, and require the source revision. They never
+  rewrite index rows, never delete extra documents, and never invent index
+  descriptions; inconsistency is returned as a warning.
+- Initialization creates a three-column self-index (md名 | description | 链接位置,
+  with real Markdown links). It lists Memory.md only when this transaction
+  created the initial empty file; a pre-existing Memory or other pre-existing
+  Markdown is not given an invented description. Existing indexes are never
+  rewritten to repair a missing row or missing self-entry.
+
+INDEX AND WARNINGS
+- The parser ignores headers, separator rows, and fenced-code examples. Only a
+  real three-column table with exact column names is accepted.
+- 链接位置 must be a real Markdown link. Targets are URL-decoded and checked for
+  absolute paths, schemes, backslashes, NUL, malformed escapes, encoded slashes,
+  dot segments, nested paths, and ../ escapes. Only a direct managed .md filename
+  is accepted. ./name.md and percent-encoded Unicode names are normalized.
+- Audit reports unlisted managed files, dangling/nonexistent targets, duplicate
+  rows, name/link mismatches, invalid columns/links, and a missing self-index.
+  It only scans direct .md children of markdowns/. Pi/vendor docs, arbitrary
+  node_modules READMEs, and native SKILL.md manifests are not managed knowledge
+  and are not counted or warned about.
+- Every tool result path can obtain one canonical line:
+  [System Meta: Index Warning: ...]
+  Audits are fresh each call, not cached until the next file mutation.
+- read(index.md) annotates each valid row link in the returned view only:
+  [System Meta: Words: N; MTime: YYYY/MM/DD HH:mm:ss; Reads24h: N]
+  MTime is the underlying file's actual mtime truncated to seconds. The source
+  index bytes and mtime are unchanged. Offset/limit/truncation come from Pi's
+  native read implementation applied to the annotated view.
+- Successful managed reads are recorded once by the chosen integration path.
+  Reading index.md records only index.md; linked files are not counted. Bash cat
+  is not counted. The rolling window is now-24h < t <= now, not a calendar day
+  and not atime. Expired records are physically pruned and the JSON state is
+  persisted atomically in the external state directory across restarts.
+- The count file is configured through readStatsFile (normally
+  <state>/read-stats/reads.json). It is outside markdowns and hidden from the
+  Worker by the sandbox contract. Metadata/counts are never written into any
+  Markdown file.
+
+TOOL RESULT ORDER AND PRESERVATION
+- Knowledge order is: optional index report (returned in indexReport; not
+  appended by default because read(index.md) is per-row annotated), Memory usage
+  line, index warning lines, then the Worker's final Current Time. A successful
+  Memory result contains at most one canonical Memory usage line.
+- The finalizer removes stale standalone lines matching Runtime-owned Memory
+  usage, index warnings, read-row summaries, or Current Time before appending the
+  authoritative copy. Images, isError, details, structuredContent, and usage are
+  preserved by the finalizer. The middleware also preserves structuredContent
+  and usage when it receives the extended descriptor shape.
+
+VERIFICATION ON THIS HOST (real results)
+- npm run check:types: success.
+- npm test: 87 tests total, 86 passed, 0 failed, 1 skipped.
+  New knowledge tests alone: 44 tests total, 43 passed, 0 failed, 1 skipped.
+  The skipped test is the Linux-only bwrap integration. It is explicitly marked
+  skipped with "not a claimed security verification on this host".
+- npm run check: success; output ended "rsi foundation checks passed."
+  It includes typecheck, the full test run, and check-plugins. check-plugins
+  loaded the two pinned extensions in its isolated smoke loader only; the
+  Supervisor/knowledge module never loads extensions and no model was called.
+- npm ci --ignore-scripts was not rerun because the inherited node_modules was
+  already present; no dependency or lockfile change was made.
+
+TEST COVERAGE IMPLEMENTED
+- 500/501 Memory, 1000/1001 document, 20/21 total quota.
+- Chinese and mixed CJK/Latin shared word counting.
+- Atomic over-limit rejection preserving bytes/revision and next request.
+- Memory visibility in the same tool loop; stale Memory CAS conflict.
+- Concurrent create, edit, and Memory commit with one winner.
+- Symlink/hardlink, nested path, non-UTF-8, NUL/unpaired-surrogate checks.
+- Cross-directory rename rejection and target-exists conflict.
+- Delete/rename/replace and no automatic index description rewriting.
+- Parent-directory deletion/replacement (directory identity) fail-closed.
+- Index header/separator/code-fence handling, URL-escaped links, ../ and encoded
+  escape rejection, unregistered/dangling/duplicate/self-entry warnings.
+- Warnings after every tool name, including plugin, web_search, sleep, control,
+  and error results.
+- read(index.md) per-row metadata, unchanged bytes/mtime, native partial reads,
+  no linked-file counting, rolling 24h boundary, persistence across reopen, and
+  physical expiry cleanup.
+- Native Pi write/edit messages, CRLF, BOM, fuzzy matching, multi-edit,
+  edit-failure preservation, over-limit atomic edit rejection.
+- Final metadata order, single Memory line, stale plugin time/metadata removal,
+  multimodal content, isError, details, structuredContent, and usage retention.
+
+LINUX / SANDBOX STATUS (NOT PASSED ON THIS HOST)
+- rsi/test/knowledge/linux-sandbox.test.ts contains two tests:
+  1. Cross-platform contract check: markdowns is ro, state is hidden, no rw
+     markdowns mount, broker hardlink policy present. This passed here.
+  2. Linux-only bwrap fixture using the public sandbox policy and a real bwrap
+     process. It attempts direct write, unlink, rename, symlink alias write,
+     hardlink, workspace write, and state read/write from inside the sandbox.
+     It is skipped on this Windows host with an explicit non-verification note.
+- The Linux fixture was not executed or counted as passed. Its hardlink assertion
+  is additionally gated on /proc/sys/fs/protected_hardlinks=1 and emits a
+  diagnostic when the host does not provide that precondition. Distinct Worker
+  uid/gid behavior and real bwrap mount behavior remain pending Linux execution.
+- Command to run on a suitable Linux host:
+  node --test test/knowledge/linux-sandbox.test.ts
+  A skip there also means not verified; it must not be reported as a sandbox
+  guarantee.
+
+GUARANTEE SCOPE / LIMITATIONS
+- This module validates and commits managed Markdown; it is not the OS sandbox.
+  Broad disk/network permissions and bwrap mounts remain owned by the sandbox
+  module. Tool hooks are not claimed as an OS sandbox.
+- The Worker must select brokered Pi operations for managed paths and ordinary
+  Pi tools for unmanaged paths. The broker itself rejects unmanaged paths, but
+  this module does not intercept or emulate Pi bash. Direct bash/extension writes
+  are prevented only by the read-only mount and hardlink/uid preconditions.
+- Arbitrary .md files created outside markdowns remain ordinary workspace files
+  by the inherited architecture; they are not managed, indexed, counted, or
+  warned about. No post-hoc watcher is used as enforcement.
+- Directory identity checks fail closed on deletion, replacement, or remount
+  between transactions. They do not claim an openat-style atomic no-race
+  guarantee against a privileged host process racing the final rename window.
+- The directory lock is in the trusted state area. Two services pointed at the
+  same markdowns directory with different state directories would not share the
+  cross-process lock; the supported runtime has one Supervisor state root.
+- Linux bwrap, distinct Worker uid, protected_hardlinks, and actual mount/alias
+  behavior were not executed on this Windows host.
+
+INTEGRATION NOTES / SHARED-CONTRACT SUGGESTIONS
+- Worker routing: classify the input path with inspectManagedToolPath or
+  service.resolveManagedToolPath. For managed read/write/edit use
+  createManagedNativeToolOperations. Keep every other path on Pi's normal local
+  tools; do not widen broker operations to a generic host path writer.
+- Worker decoration: after a successful Memory write/edit, pass the broker's
+  DocumentMutationResult.memoryUsage into tools.decorateResult.memoryUsage. The
+  native write tool itself returns Pi's normal text, so the Worker must read
+  getMemory().usage or use the broker result to supply it. Use
+  KnowledgeToolResultService.decorate, then finalizeKnowledgeToolResult (or add
+  currentTime once), rather than also composing the same appendText with the
+  shared composer.
+- Managed read accounting: choose exactly one recorder. The native read
+  operations do not record; KnowledgeToolResultService with readName records by
+  default. readManagedDocument records by default when used directly. Do not
+  call reads.record again for the same successful read.
+- read(index.md) must go through the managed read operations (or
+  readManagedDocument) so its per-row view is available; docs.read returns the
+  raw snapshot by design.
+- Suggested shared additions, not applied here to avoid parallel edits:
+  * ToolResultDescriptor: optional structuredContent, usage, and cwd/resolvedPath
+    so every middleware can preserve usage and resolve relative managed paths.
+  * ToolResultPatch: optional usage; the current Pi tool_result event supports it
+    but the shared patch interface does not.
+  * A distinct error code for invalid/corrupt managed UTF-8; this module uses
+    INTERNAL with an explicit "not valid UTF-8" message.
+  * Optional usage/version fields on MemorySnapshot; this module returns an
+    extended AuthoritativeMemorySnapshot with both.
+- The module does not implement Worker composition, IPC handlers, Supervisor main,
+  sandbox launcher, preflight, LKG, loop, or control. Their absence was not
+  papered over with fake implementations.

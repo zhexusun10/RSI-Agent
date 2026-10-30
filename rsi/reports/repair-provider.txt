@@ -1,0 +1,107 @@
+历史修复报告：下文关于自写 Pi 工具和 Agent reload 的结论已过时；现行策略见 markdowns/architecture.md。
+
+RSI P0-2 / P0-3 修复报告（Provider / Model 控制边界）
+
+日期：2026-10-27
+范围：仅修改 rsi/src/pi/** 与 provider/model 相关 acceptance/pi 测试；新增 rsi/test/acceptance/reload-provider-boundary.test.ts；本报告。
+未修改 pi/；未创建 commit；未写 Agent 系统提示词、人格或默认 prompt；未修改 integration/runtime、IPC、worker-main、sandbox、Docker/package。
+
+一、结论
+
+P0-2（reload 新 runtime 在 session_start 前没有 provider guard）与 P0-3（加载期注册 provider 改写 operator 模型 baseUrl/api）已修复，并通过本报告列出的定向/关联回归与类型检查。
+
+修复不是把现有 guard 从 reload 返回后简单挪到 beforeSessionStart，而是分三层建立边界：
+
+1. 任何候选资源加载前，在真实 live ModelRuntime 实例上安装 register/unregisterProvider、registerNativeProvider、register/unregisterVirtualModel 的拒绝 getter。
+2. 真实 ResourceLoader 返回新 runtime 后、AgentSession bindCore flush 前，直接检查 Pi 公开的 pendingProviderRegistrations / pendingNativeProviderRegistrations / pendingVirtualModelRegistrations；发现加载期注册立即以结构化 RsiError 拒绝，旧 loader 不切换。
+3. 初始 bind、真正 reload、replaceSession 的 beforeSessionStart/bindExtensions 前再次安装 extension runtime 与 ModelRuntime 双层 guard，并检查本轮是否发生过被拒绝的 mutation；session_start、tool、command、resources_discover 等晚期调用不能改变 active provider/model/route/auth/api/thinking。
+
+危险候选不会留下可调用的 candidate 工具：加载期 pending 注册在 loader 切换前拒绝；provider/session_start 边界失败通过真实 Pi reload 恢复 previous approved set；若恢复本身失败，才回退到既有 process.exit(70)/Watchdog 外部恢复。非 provider 的已提交 reload 失败仍保留原有外部恢复语义。
+
+二、代码变更
+
+1. rsi/src/pi/control-guard.ts
+   - 新增 pending provider/native/virtual 注册检查 assertNoPendingProviderMutations()。错误码 PLUGIN_MANIFEST_MISMATCH，details.reason=provider-mutation-during-extension-load，包含 operation/target/extensionPath，不包含 provider config 密钥。
+   - installModelRuntimeGuard()：在 live ModelRuntime 上安装 getter/setter 拒绝边界；bindCore 的 providerActions flush 也不能绕过。
+   - installProviderApiGuard() 与 ModelRuntime guard 共用同一实现；覆盖全部五个 API。
+   - 记录被拒绝的 mutation attempt；assertNoProviderMutationAttempts() 将其转换为 AGENT_COMMAND_FORBIDDEN + details.reason=provider-mutation-rejected，使 reload/bind 错误可见，而不是静默忽略。
+   - 支持 computed 访问（pi["registerProvider"]）和保留函数引用（const r = pi.registerProvider; r(...)），因为 extension API 方法在调用时仍回到受保护的 runtime/ModelRuntime 方法。
+
+2. rsi/src/pi/resource-loader.ts
+   - RestrictedResourceLoader.validate() 在切换 this.loader 之前检查真实 pending 注册数组。该检查基于 Pi 公共 runtime 数据结构，不是源码 substring/grep。
+
+3. rsi/src/pi/worker.ts
+   - createPiWorker() 在 resourceLoader.reload() 之前创建 guard 并 installModelRuntimeGuard(options.modelRuntime)，覆盖 initial approved candidate 与 Watchdog 新 Worker 启动。
+   - bindCurrentSession() 在 bindExtensions 前安装 runtime guard，bind 后检查本轮回调是否尝试 provider mutation；覆盖初始启动与 replaceSession 重新绑定。
+   - reload 的 beforeSessionStart() 在 session_start 前安装 runtime guard、检查 pending/attempt；reload 返回后再检查 session_start/resources_discover 期间的 attempt。
+   - prepareRuntimeForSessionStart() 统一 MCP cap、required plugin、approved set、Skill cap 与 provider guard 顺序。
+   - restorePreviousSession() 通过真实 Pi reload 重新加载 previous approved set，卸载候选工具/MCP/hooks；恢复失败才 process.exit(70) 交给 Watchdog。
+   - 保留原有非 provider、已提交 reload 失败的外部恢复路径。
+
+4. rsi/test/acceptance/reload-provider-boundary.test.ts（新增）
+   - initial approved candidate 在 session_start 尝试 computed unregisterProvider：启动失败、模型/provider 路由不变。
+   - reload 加载期 registerNativeProvider + registerVirtualModel：结构化拒绝、虚拟模型不存在、候选工具不可调用。
+   - session_start 使用 computed + 保留引用尝试 registerProvider/unregisterProvider，攻击 baseUrl 指向本地 mock HTTP：reload 拒绝、原 baseUrl/api 不变、攻击服务 0 请求、候选工具卸载。
+   - 晚期 tool 调用覆盖 retained/computed registerProvider、registerNativeProvider、registerVirtualModel、unregisterVirtualModel、unregisterProvider、setModel、setThinkingLevel：全部 BLOCKED，路由与 thinking 不变。
+   - 晚期 command 调用覆盖同上 provider/model/thinking 控制：全部 BLOCKED。
+   - replaceSession 后重新绑定：command 中的 provider/model/thinking mutation 仍被拒绝。
+   - 普通安全自定义工具 reload 完整路径：reload 成功、新工具可调用、旧工具移除、operator provider 路由不变。
+
+三、覆盖时点
+
+- initial approved candidate：loader pending 检查 + 启动 bind 前 ModelRuntime/runtime guard + session_start 后 attempt 检查。
+- 真正 reload：preflight 后、resourceLoader 返回后、bindCore flush 前、session_start 前、session_start 后、resources_discover 后均有边界或检查。
+- replaceSession：新 session bindExtensions 前安装 guard，bind 后检查 attempt。
+- Watchdog 恢复：每次新 Worker 在 resourceLoader.reload 前重新安装 ModelRuntime guard，初始 candidate 同样受 pending 检查。
+- 晚期 tool/command：runtime guard 仍在，ModelRuntime guard 始终在；setModel/setThinkingLevel/cycle/shutdown 原有 SessionControlGuard 不回退。
+
+四、验证证据
+
+环境：Windows MINGW64，Node v24.16.0；使用仓库已有依赖，无新增依赖、无 npm install、无真实 key、无付费请求；攻击 URL 仅为 127.0.0.1 本地 mock HTTP。
+
+1) cd rsi && npm run check:types
+   EXIT 0。
+
+2) cd rsi && npm run check:plugins
+   EXIT 0，实际加载：
+   ./rsi/node_modules/pi-continuity/extensions/index.ts
+   ./rsi/node_modules/pi-better-web-search/extensions/index.ts
+
+3) 新增专项测试：
+   node --test --test-concurrency=1 test/acceptance/reload-provider-boundary.test.ts
+   tests 7, pass 7, fail 0。
+
+4) P0-2/P0-3 与相邻回归联合：
+   node --test --test-concurrency=1 test/acceptance/reload-provider-api-guard.test.ts test/acceptance/reload-provider-boundary.test.ts test/acceptance/reload-rejection-loaded-state.test.ts test/acceptance/pi-model-api-guard.test.ts test/pi/reload-guard.test.ts
+   tests 14, pass 14, fail 0。
+   包含原失败回归：
+   - candidate session_start cannot unregister active provider during reload
+   - extension load cannot redirect active model to candidate provider
+   - approved extension present at startup cannot redirect active model during load
+   - reload rejected before session_start leaves no candidate tools/MCP servers
+
+5) 全部 test/pi：
+   node --test --test-concurrency=1 test/pi/*.test.ts
+   tests 26, pass 26, fail 0。
+   覆盖 Memory 每请求 system、工具时间/多模态、MCP cap、插件、reload 正常路径与 replaceSession。
+
+6) 真实 Worker 关联集成：
+   node --test --test-concurrency=1 test/integration/runtime-reload-control.test.ts test/integration/runtime-reload-preflight.test.ts
+   tests 2, pass 2, fail 0。
+   node --test --test-concurrency=1 test/integration/runtime-plugins-resources.test.ts test/integration/runtime-knowledge.test.ts
+   tests 2, pass 2, fail 0。
+   覆盖六扩展 reload + 3 健康轮路径、preflight 失败不进入真实 reload、npm continuity/web_search、MCP/Skill 独立上限、Memory/文档。
+
+7) 单独复核：
+   node --test --test-concurrency=1 test/acceptance/runtime-reload-rejection-cleanup.test.ts -> pass 1。
+   node --test --test-concurrency=1 test/acceptance/runtime-provider-payload-guard.test.ts -> pass 1。
+
+说明：`npm run check` 的并行全量套件未作为通过证据。其在 600s 内未完成，日志中仍出现与本任务无关的 final-audit 已知失败（preflight-child-executable、preflight-stderr-alias、runtime-managed-alias、P0-5 before_agent_start system section 等）；并行环境下 runtime-provider-payload-guard 一次超时，随后单独运行通过。P0-2/P0-3 的定向回归均通过，未把全量红/超时当作通过。
+
+五、安全边界与限制
+
+- 本修复堵住的是正常 ExtensionAPI 等价控制面：五个 provider API、computed 属性访问、保留方法引用、setModel/setThinkingLevel/cycle/shutdown，以及初始/reload/replaceSession/Watchdog 启动时点。
+- 任意恶意同进程 JavaScript 仍可通过原型链、反射、直接改写内存或已暴露对象绕过任何进程内 API 包装；这不是 OS 级恶意代码隔离，不夸大保证。生产安全仍依赖 bwrap/UID/文件系统与 Supervisor 边界。
+- 没有引入“禁止所有扩展”的策略：连续性/web_search 两个 npm 插件、普通安全工具、正常 command、正常 reload 仍通过现有回归。
+- 未新增 provider 接口，也未修改 IPC。若最终集成需要把拒绝原因以机器可读 details 持久化到 Supervisor，可扩展现有 WorkerReloadPort.failed(attemptId, reason) / reload.failed IPC 以携带 RsiError.code/details；当前错误 message 已可见，code/details 在 Worker 内保留。
+- Watchdog 外部恢复语义保持不变；provider 边界失败优先通过真实 Pi reload 回滚旧 approved 集，只有回滚失败才走既有 process.exit(70)/Watchdog。非 provider 的已提交 reload 失败仍走原外部恢复。

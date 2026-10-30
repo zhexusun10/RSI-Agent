@@ -1,0 +1,59 @@
+RSI-AGENT 整合验收报告（本机合并结论，不是独立最终审计）
+
+日期：2026-10-28
+宿主：Windows MINGW64_NT-10.0-26300，Node v24.16.0，npm 11.13.0
+结论：统一生产预检与真实 container-entrypoint 验收两个分支已完成接线合并；本机完整套件 330 tests / 312 pass / 0 fail / 18 skip，`npm run check` EXIT 0，最终 `rsi checks passed.`。真实 Linux/bwrap/Docker entrypoint、目标 namespace/UID/FD/seccomp/AppArmor、24H soak 未执行，因此生产目标验收仍为 blocked_environment，不能宣称生产安全或 24H 稳定。
+
+历史说明：此前 integration 报告的 311/294/17 是本轮合并前的数字，已被本轮 330/312/0/18 取代。独立 `rsi/reports/final-audit.txt` 未修改；最终验收应由下游独立节点重新判定。
+
+一、合并与接线修复
+
+1. 统一预检
+- CLI `--check` / `--start`、真实 container-entrypoint 先运行的 `deployment-preflight.mjs`、launcher 前置检查共用 `src/sandbox/preflight.ts` 的同一严格 probe；各进程重新执行，不共享可篡改报告。
+- 要求 Linux、非 setuid bwrap + `--disable-userns`、root Supervisor 切换到独立非 root host Worker uid/gid、同一 setpriv `--reuid/--regid/--clear-groups`（或 spawn uid/gid）。
+- 真实 probe 从沙箱外核对 `/proc/<pid>/status` host uid/gid，并核对 namespace uid/gid、补充组清除、CapEff=0、PID/user/mount namespace、`/`/proc/UTS、`fs.protected_hardlinks=1`、`fs.protected_symlinks=1`；任何缺项/超时/不一致 fail closed。
+- 已删除 deployment-preflight 的第二套手写 bwrap probe；未保留 root 第二次弱 probe，也未保留 CLI 弱检查。
+
+2. 真实 entrypoint 验收接线
+- `linux-entrypoint-smoke.mjs` 的受测容器使用镜像默认 ENTRYPOINT，无 `--entrypoint` 覆盖；prepare/mock helper 才使用 `--entrypoint node`。
+- 修复分支冲突：旧 smoke 要求 `[rsi-preflight] bwrap namespace probe passed`，统一探针现输出 `[rsi-preflight] full sandbox preflight passed`。smoke 改为解析该统一行，并强制断言 host/namespace uid/gid、CapEff=0、supplementary groups cleared、namespace/mount verified、两个 protected sysctl=true；首次与卷重启均检查。
+- driver 新增渲染配置断言：workerUid/Gid、bwrapPath、workspace/state/markdowns/prompt 路径、UTC、unrestricted network；Worker probe 新增 GID 与 supplementary groups 断言。
+- 原有 target 调试 harness 保留 `docker run --entrypoint node`，只用于 Linux reload/sleep/crash 调试，不当作生产入口证据。
+- CI 路径过滤包含 `.dockerignore`、`markdowns/**`、`rsi/**`；新增 `test/repository-docs.test.ts` 与 `test/acceptance/review2-markdown-seed.test.ts` 步骤，要求五篇 seed 精确一致、逐篇 <=1000 词、index 三列且一致，缺失即失败关闭。CI 不执行 24H soak。
+
+3. 保留的既有修复
+- 候选加载前 ModelRuntime guard、session_start 前 provider guard、拒绝/回滚后候选 MCP/tool 清理、system section 边界、preflight Node+argv/安全 cwd/stderr alias 防护。
+- Watchdog 使用 host bwrap PID；IPC token/launchId/generation/撤销/重放防护；sleep 重启与 operator cancel；managed alias 路由；工具 metadata/时间；operator config 基线与只读 mount；容器五篇 seed；日志脱敏。本轮没有为 target 删除断言或增加掩盖 skip。
+
+二、实际执行命令与结果
+
+1) `cd rsi && npm run check:types` -> EXIT 0。
+2) `cd rsi && npm run check:plugins` -> EXIT 0；实际加载：
+   - `./rsi/node_modules/pi-continuity/extensions/index.ts`
+   - `./rsi/node_modules/pi-better-web-search/extensions/index.ts`
+3) `cd rsi && node --test --test-concurrency=1 test/acceptance/review3-preflight-parity.test.ts test/deployment/deployment.test.ts test/deployment/linux-target-config.test.ts test/deployment/production-entrypoint.test.ts test/repository-docs.test.ts`
+   -> tests 29、pass 28、fail 0、skipped 1；唯一 skip 为真实 Linux bwrap preflight，不是通过。
+4) `cd rsi && npm run check` -> EXIT 0；98 个测试文件，tests 330、pass 312、fail 0、skipped 18、todo 0，duration_ms 574995.9381（复跑；首跑 556081.8208），最终 `rsi checks passed.`。18 skip 全部是 Linux/bwrap/namespace/Docker 目标条件。
+5) `cd rsi && node scripts/linux-validation.mjs --mode docker --suite all --no-build --timeout-ms 60000 --report .artifacts/merge-final-linux-validation-blocked.json` -> EXIT 1；实际 `Linux target validation requires a Linux host; current platform is win32.`。suite=all 的 target 与 entrypoint 都因此 fail closed，没有生成通过报告。
+6) `cd rsi && RSI_TARGET_STRICT=1 node --test --test-concurrency=1 test/deployment/linux-target-acceptance.test.ts` -> EXIT 1；tests 1、pass 0、fail 1、skipped 0；错误为严格前置失败，明确不把缺失 Linux/namespace/Docker 转成 skip。
+7) 宿主：`bwrap --version` 不存在；`docker info` 无法连接 npipe docker_engine；`wsl -l -v` 返回 Wsl/0x80070422。未启动 Docker/WSL 服务，没有重复无效重试。
+8) Markdown：5 篇；architecture 1000、operations 997、security 994、index 103、Memory 0；每篇 <=1000、总数 <=20；index 三列、自登记、5 行链接一致，audit consistent=true。
+
+三、环境/证据边界
+
+- 本机通过的是功能、进程内/本地子进程、真实 Worker 子进程和本地 mock provider 回归；不是 Linux 内核 namespace、Docker 容器或生产入口目标通过。
+- CI YAML 只做过本地解析/静态断言，未在 GitHub Actions 运行；YAML 存在不等于 CI 通过。
+- 真实 provider/OAuth/MCP/web_search 未执行；无付费 API，web_search 只用本地 mock HTTP。
+- 24H soak 未启动；不得用脚本存在或短测推断稳定性。
+- IPC token 不能隔离已作为合法 Worker 运行的恶意扩展；同进程插件可伪造自身 health/reload/settled，3 轮健康/LKG 是 Supervisor 自证，不是独立外部可信观察者。
+- 未 commit/push；`git diff -- pi` 与 `git diff --cached -- pi` 必须为空；未写 Agent 提示词、人格或默认 prompt；Memory.md 保持空。
+
+四、剩余阻塞与后续门禁
+
+1. 真实 Linux root + 非 setuid bwrap：首次 baseline、reload static/mock、setpriv UID/GID、补充组、CapEff、namespace/FD/mount、seccomp/AppArmor。
+2. Docker build/up、真实 ENTRYPOINT、config render、seed、operator ro-bind、Supervisor/bwrap/Pi、本地 mock provider、healthcheck、正常 TERM、双容器卷重启。
+3. 24H soak 与真实 provider/OAuth/MCP/web_search 网络/凭证。
+4. GitHub Actions 实际运行结果。
+5. 下游独立节点复验并更新最终审计；实现节点不自行把 final-audit 改成通过。
+
+最终判定（本机实现与接线）：通过本机完整套件和合并回归；生产目标验收仍为 blocked_environment / 未通过，等待真实 Linux+Docker 目标与独立复核。

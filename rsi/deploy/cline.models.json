@@ -1,0 +1,22 @@
+{
+  "providers": {
+    "cline": {
+      "name": "ClinePass",
+      "baseUrl": "https://api.cline.bot/api/v1",
+      "api": "openai-completions",
+      "apiKey": "$CLINE_API_KEY",
+      "models": [
+        {
+          "id": "cline-pass/deepseek-v4.1-flash",
+          "name": "DeepSeek V4.1 Flash",
+          "reasoning": true,
+          "thinkingLevelMap": { "max": "max" },
+          "input": ["text", "image"],
+          "contextWindow": 1000000,
+          "maxTokens": 128000,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        }
+      ]
+    }
+  }
+}

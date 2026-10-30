@@ -1,0 +1,176 @@
+RSI review3 预检对称性修复报告（统一 runtime preflight）
+
+日期：2026-10-28（本轮）
+宿主：Windows MINGW64_NT-10.0-26300，Node v24.16.0，npm 11.13.0
+范围：只修改 `rsi/src/sandbox/preflight.ts`、`rsi/src/sandbox/argv.ts`、`rsi/src/sandbox/types.ts`、`rsi/src/main.ts`、`rsi/scripts/deployment-preflight.mjs`、对应 sandbox/deployment/CLI 测试，并新增 `rsi/test/acceptance/review3-preflight-parity.test.ts` 与本报告。
+未修改 `pi/`；未 commit/push；未修改 Docker/Compose/CI/container-entrypoint、业务 runtime/provider/IPC/知识模块或 Markdown；未新增 unsafe fallback；未扩大容器/Worker capabilities；未以 root 运行 Worker；未跳过 sysctl 检查。
+
+一、结论（先说明证据边界）
+
+- 已把直接 CLI、Docker 部署入口和 launcher 前置检查统一到同一份可信预检实现：真实的非 setuid bwrap、`--disable-userns`、独立 host Worker UID/GID、清 supplementary groups、真实 setpriv/spawn 身份切换、PID/user/mount namespace、/proc CapEff=0、`fs.protected_hardlinks=1` 与 `fs.protected_symlinks=1` 全部失败关闭。
+- 已删除 `deployment-preflight.mjs` 内第二套手写 bwrap argv/probe；该脚本不再 `spawnSync` bwrap，也不再从 Supervisor 身份直接探测。它只消费 `inspectConfiguredSandboxPreflight()` 的同一报告。
+- 宿主 identity 不再用 namespace 内 `id -u` 代替：Supervisor 在沙箱外通过 `/proc/<sandboxed node pid>/status` 读取 `Uid:`/`Gid:` 四元组，并与配置 host Worker UID/GID 逐项比对；namespace 内的 uid/gid 只作为独立事实一并校验。root 启动 bwrap 导致 inside uid=10002、host uid=0 的情况会被拒绝。
+- 本机完整套件实际通过：`npm run check` -> tests 326、pass 308、fail 0、skipped 18，EXIT 0，最终 `rsi checks passed.`。新增/修改的定向测试通过；strict Linux target 在 win32 仍明确失败而不是 skip。
+- 这不是真实 Linux/bwrap 目标通过。本宿主 `bwrap` 不存在、Docker daemon 不可用；真实 bwrap/setpriv、/proc 宿主 UID 读取、namespace inode 比较、目标 sysctl、Docker build/up/entrypoint 与 24H soak 均未执行。mock/源码检查没有被当作目标通过。
+
+二、公共接口与行为变化
+
+1. `rsi/src/sandbox/types.ts`
+   - 新增 `SandboxSysctlReader`（测试可注入的受限 sysctl 读取器）。
+   - 新增 `BubblewrapRuntimePreflightOptions`：`workerUid`、`workerGid`、可选 `supervisorUid`、`supervisorGid`、`probeTimeoutMs`、`credentialHelperPath`、测试专用 `readSysctl`。生产调用方不传 `readSysctl`，配置文件/环境变量无法设置该测试缝。
+   - `BubblewrapPreflightReport` 只新增兼容的可选字段，旧报告字面量仍可编译：
+     `protectedSymlinksEnabled`、`workerGidDistinct`、`probeExecuted`、`namespaceVerified`、`mountVerified`、`capEffZero`、`supplementaryGroupsCleared`、`hostIdentityVerified`、`observedHostUid`、`observedHostGid`、`observedNamespaceUid`、`observedNamespaceGid`、`probeHostPid`、`probeNamespacePid`。
+     未修改 `shared/sandbox.ts` 的旧 `SandboxPreflightReport`。
+
+2. `rsi/src/sandbox/preflight.ts`
+   - `inspectBubblewrapRuntime(options, bwrapCommand?)` 的 options 类型改为上述接口；`BubblewrapLauncherOptions` 仍结构性兼容，launcher 无需改动即可复用同一实现。
+   - 新增 `inspectConfiguredSandboxPreflight(config, options?)`：直接 CLI `--check/--start` 与 `deployment-preflight.mjs` 的唯一配置级入口。缺少 `sandbox.workerUid/workerGid` 时返回失败报告，报告 `probeExecuted=false`、`namespaceVerified=false`，不伪造通过。
+   - 新增 `inspectProtectedSysctls(readSysctl?)`：只认 `1`；不可读、空值、0/其他值均失败关闭。默认读取真实 `/proc/sys/fs/...`。
+   - 新增 `parseBubblewrapFeatureSet(helpText, setuid)`：setuid 或缺少 `--disable-userns` 时 `disableUserns=false`。
+   - 新增 `runSandboxRuntimeProbe(input)`：以真实生产凭据命令启动 bwrap，收集 stdout/stderr、超时、退出状态、host `/proc` identity；超时/启动失败/非零退出/输出解析失败均不能被当成成功。
+   - 新增 `assessSandboxProbeFacts(facts, hostIdentity, expectations, hostIdentityError?)`：纯判定函数，集中验证 host/namespace 身份、groups、CapEff、namespace inode、mount/proc/UTS 事实。
+   - 新增 `parseSandboxProbeFacts(stdout, resultMarker)`：严格解析；缺失/非法 groups、uid/gid/pid/ppid 直接判为不可用。
+   - `formatPreflightReport` 新增 `protected_symlinks=...`、`probe_executed=...`、`namespace_verified=...`、`mount_verified=...`、`cap_eff_zero=...`、`supplementary_groups_cleared=...`、`host_identity_verified=...` 及 host/namespace uid/gid 与 pid 行。
+
+3. `rsi/src/sandbox/argv.ts`
+   - `buildBubblewrapProbeArgv` 使用 `BubblewrapFeatures`，并增加 `--hostname rsi-preflight`，与生产 Worker 的 UTS namespace 形状对齐。
+   - 新增 `buildSandboxRuntimeProbeScript({workerUid, workerGid, marker, holdMs?})`：脚本只报告事实（pid/ppid/uid/gid/groups、`/proc/self/status` 的 CapEff、pid/mnt/user ns inode、mountinfo、hostname、procfs type），不自行判定通过/失败。
+   - 新增 `buildBubblewrapCredentialCommand(...)`：setpriv 路径严格生成 `setpriv --reuid U --regid G --clear-groups -- bwrap ...`；无 setpriv 时生成真实 `spawn(uid,gid)` 命令。探针执行的是该真实命令，不是只校验 argv 字符串。
+   - 新增常量 `SANDBOX_RUNTIME_PROBE_READY_MARKER`、`SANDBOX_RUNTIME_PROBE_RESULT_MARKER`、`SANDBOX_RUNTIME_PROBE_HOSTNAME`。
+
+4. `rsi/src/main.ts`
+   - `rsi --check` 和 `--start` 的 `checkBubblewrap` 改为调用 `inspectConfiguredSandboxPreflight`，不再直接拼 `inspectBubblewrapRuntime` 参数。
+   - `--check` 成功信息明确列出 `namespace_verified`、`mount_verified`、host/namespace uid、CapEff=0、groups cleared、两个 sysctl=1，并明确 “The Worker was NOT started; this validates the real sandbox probe, not a running Worker.”。
+   - 帮助文本更新为完整 sandbox preflight，不再暗示只检查 bwrap 可执行文件。
+
+5. `rsi/scripts/deployment-preflight.mjs`
+   - 删除第二套 probe：`spawnSync`、`buildProbeArgs`、`probeBwrap`、`capabilityMask`、`readProc`、`diagnoseBwrapFailure` 以及直接读取 `/proc/sys/fs/protected_symlinks`/`/proc/self/status` 的代码全部移除。
+   - 全量模式只调用 `inspectConfiguredSandboxPreflight(config, { probeTimeoutMs: 20_000 })`，失败时只格式化同一报告；成功时输出报告中的 host/namespace uid/gid、CapEff、groups、namespace/mount、两个 sysctl、credential strategy、disableUserns、bwrap 版本/路径。
+   - `--config-only` 明确输出：`config-only: Worker NOT started; bwrap executable, namespaces, mount, host/namespace UID/GID, supplementary groups, CapEff and fs.protected_hardlinks/symlinks were NOT verified. This is not a complete preflight pass.` 不再有任何 “probe passed” 措辞。
+
+6. `rsi/test/deployment/linux-target-harness.ts`
+   - 目标 harness 改为消费同一报告的可选字段（`probeExecuted`、`hostIdentityVerified`、`namespaceVerified`、`mountVerified`、`capEffZero`、`supplementaryGroupsCleared`、两个 sysctl），删除目标侧第二套 sysctl 读取。strict 模式下任一字段未验证都直接失败，不转 skip。
+
+三、强制条件与失败关闭（实现要点）
+
+1. 实际 bwrap 与 feature：
+   - 解析 realpath 后 lstat；setuid/setgid 直接失败。
+   - `--version`、`--help` 失败或缺少 `--disable-userns` 直接失败；setuid 时即使 help 含该 flag 也判为不可用。
+   - 不存在/不可执行的 bwrap 在 `resolveBubblewrapExecutable` 处失败，不进入 probe。
+
+2. 独立 host Worker UID/GID：
+   - 配置层要求 Supervisor UID 为 0，workerUid/workerGid 非 0 且分别不等于 Supervisor UID/GID。
+   - 真实 probe 从沙箱外读取 sandboxed node 进程的 `/proc/<pid>/status`，要求 `Uid:` 四值与 `Gid:` 四值全部等于配置 Worker UID/GID。namespace 内 `uid/gid` 另行要求等于配置值；两者不能互相替代。
+   - 因此“namespace 内 `id -u`=10002，但 host uid 仍是 0”会被 `host UID values ... do not all equal` 拒绝。
+
+3. 清 supplementary groups：
+   - setpriv 路径使用真实 `--clear-groups`；spawn-uid 路径由真实 probe 验证。
+   - 沙箱内 `getgroups()` 必须为空或只含 Worker GID；出现 0 或其他组即失败。
+
+4. 正确 setpriv/spawn 身份：
+   - probe 与生产 launcher 使用同一命令形状；setpriv 参数为 `--reuid`、`--regid`、`--clear-groups`、`--`。
+   - 不再只比较 argv；probe 真正经过该身份切换运行 bwrap。
+
+5. namespace 与 mount：
+   - 沙箱内报告 pid 与沙箱外 host pid 必须不同；`/proc/self/ns/pid`、`/proc/self/ns/user` inode 必须不同于 Supervisor 的对应 inode。
+   - 必须同时满足：`/proc/self/ns/mnt` inode 不同于 Supervisor、mountinfo 存在 `/` 根挂载点、`/proc` 为 `proc` 文件系统（`PROC_SUPER_MAGIC=0x9fa0`）、UTS hostname 为 `rsi-preflight`。
+
+6. CapEff=0：
+   - 从沙箱内 `/proc/self/status` 读取 `CapEff`；缺失、非法十六进制或 BigInt 非 0 均失败。
+
+7. sysctl：
+   - `fs.protected_hardlinks` 与 `fs.protected_symlinks` 都必须可读且等于 `1`；不可读、空、0 或其他值都失败。`--config-only` 不声称已验证这两项。
+
+8. 超时/解析/身份读取：
+   - probe 有 parent 截止时间；超时明确记录 `probe timed out after Nms` 并失败。
+   - stdout 超过 1 MiB、spawn 失败、非零退出、缺少 result marker、JSON 非法、Uid/Gid 不可读、找不到 sandboxed node 进程、host namespace inode 不可读，全部失败关闭。
+   - probe 用 stdin 释放信号让子进程正常 exit 0；不会把“父进程主动 SIGTERM”误判为 probe 失败。
+
+四、删除的重复 probe 与“同一结果”边界
+
+- 删除的重复探针位于旧 `deployment-preflight.mjs`：`buildProbeArgs` 构造 `--unshare-user --disable-userns ... --ro-bind / / ... /bin/sh -c 'id -u; grep CapEff'`，再由 Supervisor 直接 `spawnSync`；它没有经过 setpriv/清补充组，且只用 `id -u` 判断 uid。该代码已完全删除。
+- 当前 `deployment-preflight.mjs` 的静态检查可确认：无 `spawnSync`、无 `buildProbeArgs`、无 `--cap-drop`、无直接 `/proc` read。CLI 与 wrapper 都调用 `inspectConfiguredSandboxPreflight`/`formatPreflightReport`。
+- launcher 的前置检查仍调用同一个 `inspectBubblewrapRuntime`；没有第二套 argv 或另一身份 probe。CLI、deployment wrapper、launcher 各自进程边界仍会真实重跑 probe（防止跨进程伪造报告），但三者使用同一实现、同一凭据策略、同一报告语义，不存在“一个入口通过、另一个假失败”的两套保证。
+- 未引入从文件读取预检结果并直接信任的机制；跨进程不共享可篡改的缓存。
+
+五、实际执行命令与结果
+
+环境确认：
+
+1) `cd rsi && node -e "console.log(process.version)"`
+   - Node v24.16.0。
+2) `bwrap --version` -> `bwrap: command not found`（本次命令在 bash 中实际不存在；因此没有任何真实 bwrap 执行证据）。
+3) `docker info --format '{{json .ServerVersion}}'` -> 无法连接 `npipe:////./pipe/docker_engine`，Docker daemon 不可用。
+
+依赖与静态检查：
+
+4) `cd rsi && npm ci --ignore-scripts` -> EXIT 0；added 122 packages；audit 报告 1 moderate + 1 high（未运行 `npm audit fix`，未构建 Pi）。
+5) `cd rsi && npm run check:types` -> EXIT 0。
+6) `cd rsi && npm run check:plugins` -> EXIT 0；实际加载 `./rsi/node_modules/pi-continuity/extensions/index.ts` 与 `./rsi/node_modules/pi-better-web-search/extensions/index.ts`。
+7) `node --check scripts/deployment-preflight.mjs`、`linux-validation.mjs`、`linux-smoke.mjs`、`linux-soak.mjs`、`linux-target-docker.mjs` -> 全部 EXIT 0；只证明语法，不证明目标执行。
+
+完整套件：
+
+8) `cd rsi && npm run check` -> EXIT 0，最终 `rsi checks passed.`。
+   实际：97 个 .test.ts 文件；tests 326、pass 308、fail 0、skipped 18、todo 0、duration_ms 549667.2447。
+   18 个 skip 全部是 Linux/bwrap/namespace/Docker 目标条件（17 个原有 + 新增真实 Linux preflight 用例在 Windows 上 1 个），skip 不计为通过。
+   日志：`rsi/.artifacts/review3-preflight-full-check.log`。
+
+新增/修改的定向测试：
+
+9) `cd rsi && node --test --test-concurrency=1 test/acceptance/review3-preflight-parity.test.ts test/sandbox/argv.test.ts test/sandbox/preflight.test.ts test/deployment/deployment.test.ts test/deployment/linux-target-config.test.ts`
+   - tests 38、pass 37、fail 0、skipped 1、duration_ms 6337.5653。
+   - 覆盖：完整 probe 事实才接受；任一 sysctl 不可读/为 0 拒绝；CapEff 非 0 拒绝；错误 host UID/GID/残留 supplementary group 拒绝；namespace-only uid 拒绝；缺少 host identity/namespace/mount 拒绝；真实子进程超时拒绝；缺 bwrap（解析失败与 spawn 失败）和缺 `--disable-userns` 拒绝；缺少 workerUid/Gid 不报告 namespace 已验证；`--config-only` 明确未验证；wrapper 无第二 probe；CLI 与 wrapper 输出同一 FAIL 报告；真实 Linux strict 用例。
+10) `cd rsi && RSI_TARGET_STRICT=1 node --test --test-concurrency=1 test/deployment/linux-target-acceptance.test.ts`
+    - EXIT 1；实际 `Linux target acceptance prerequisites failed: requires Linux; current platform is win32 ... does not turn a missing Linux/namespace/Docker prerequisite into a skip.`；tests 1、pass 0、fail 1、skipped 0。
+    - 日志：`rsi/.artifacts/review3-preflight-target-strict.log`。
+11) `cd rsi && RSI_TARGET_STRICT=1 node --test --test-concurrency=1 test/acceptance/review3-preflight-parity.test.ts`
+    - EXIT 1；10 pass、1 fail、0 skipped；失败项为真实 Linux preflight 在 strict 模式下要求 Linux，明确不是 skip。
+    - 日志：`rsi/.artifacts/review3-preflight-review3-strict.log`。
+12) `cd rsi && node scripts/linux-validation.mjs --mode docker --no-build --timeout-ms 60000 --report .artifacts/review3-preflight-linux-validation.json`
+    - EXIT 1；实际 `[target] FAILED: Linux target validation requires a Linux host; current platform is win32.`。
+    - 未生成目标通过报告；JSON 只可能记录前置失败（如有）。
+
+六、未执行与不能宣称的内容
+
+以下均未执行，不能由本次 mock、源码检查、单元测试或 skip 推断为通过：
+
+1) 真实 Linux root + 非 setuid bwrap 的 `--disable-userns`、setpriv `--reuid/--regid/--clear-groups`、真实 host `/proc/<pid>/status` UID/GID 读取。
+2) 真实 PID/user/mount namespace inode 比较、pivot root、/proc procfs、UTS hostname。
+3) 真实沙箱内 `CapEff=0`、`getgroups()` 清空、`fs.protected_hardlinks=1`、`fs.protected_symlinks=1`。
+4) Docker build/up、container-entrypoint、部署 wrapper 在真实容器内先于 Supervisor 运行、healthcheck、卷恢复。
+5) 24H soak、真实 provider/OAuth/MCP/web_search 网络、GitHub Actions 实际结果。
+6) 本报告没有把 Windows 上的 18 个 skip 或 `npm run check` 通过称为 Linux/Docker 目标通过。
+
+七、真实 Linux target 上的预期与剩余风险
+
+- target harness 现在要求 `probeExecuted`、`hostIdentityVerified`、`namespaceVerified`、`mountVerified`、`capEffZero`、`supplementaryGroupsCleared` 和两个 sysctl 全部为 true；任一为 false 在 `RSI_TARGET_STRICT=1` 下直接失败，不会变绿。
+- 真实 target 若失败，最可能的原因是部署侧而非预检放宽：`setpriv` 未安装/路径不同、`/proc/<bwrap>/task/.../children` 或 `/proc/<node>/status` 受 hidepid/seccomp 限制、bwrap 版本不支持 `--disable-userns`、目标 kernel sysctl 不为 1、或 target 没有 root 切换到独立 Worker UID。这些都应按失败处理，不能通过增加 capabilities、以 root 跑 Worker 或跳过 sysctl 修复。
+- probe 依赖 Node 可执行路径精确出现在 sandboxed 进程 cmdline 中；当前使用 `process.execPath` 且 `--bind / /`，预期一致。若 target 的 Node 包装器改变 argv[0]，预检会失败关闭而不是降级。
+- 首次 operator Pi 配置基线、真实 bwrap 下 P1-5 ro-bind、P1-8 容器 seed 等属于既有风险，不在本次修改范围内；本次未重新验收。
+
+八、文件清单（本轮实际修改/新增）
+
+修改：
+- `rsi/src/sandbox/types.ts`
+- `rsi/src/sandbox/argv.ts`
+- `rsi/src/sandbox/preflight.ts`
+- `rsi/src/main.ts`
+- `rsi/scripts/deployment-preflight.mjs`
+- `rsi/test/sandbox/argv.test.ts`
+- `rsi/test/deployment/linux-target-config.test.ts`
+- `rsi/test/deployment/linux-target-harness.ts`
+
+新增：
+- `rsi/test/acceptance/review3-preflight-parity.test.ts`
+- `rsi/reports/preflight-parity.txt`
+
+未修改：`pi/`、Docker/Compose/CI、container-entrypoint、业务 runtime/provider/IPC/知识模块、Markdown。未 commit/push；`git rev-parse HEAD` 仍为 `79e47c454cda8158fdacd339fe3a3894adac1b0b`。
+
+合并说明（2026-10-28）：本分支已与 production-entrypoint 验收分支合并。统一探针的
+成功输出由 entrypoint smoke 直接消费：`[rsi-preflight] full sandbox preflight passed`，
+并核对 host/namespace uid/gid、CapEff=0、supplementary groups cleared、namespace/mount
+verified、protected_hardlinks/symlinks=true。旧 smoke 的
+`[rsi-preflight] bwrap namespace probe passed` 断言已移除。合并后本机完整套件为
+330 tests / 312 pass / 0 fail / 18 skip，EXIT 0；本文前面的 326/308/18 是合入
+entrypoint 分支前的历史数字。真实 Linux/Docker entrypoint 与 24H soak 仍未执行。

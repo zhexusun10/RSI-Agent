@@ -1,0 +1,145 @@
+name: RSI Linux Docker validation
+
+on:
+  push:
+    paths:
+      - ".github/workflows/rsi-linux.yml"
+      - ".dockerignore"
+      - "markdowns/**"
+      - "rsi/**"
+  pull_request:
+    paths:
+      - ".github/workflows/rsi-linux.yml"
+      - ".dockerignore"
+      - "markdowns/**"
+      - "rsi/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rsi-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bounded-linux-docker-smoke:
+    name: bounded Linux+Docker target and production entrypoint smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use pinned Node 22.19
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.19.0"
+          cache: npm
+          cache-dependency-path: rsi/package-lock.json
+
+      - name: Install locked dependencies
+        working-directory: rsi
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Type-check deployment and target tests
+        working-directory: rsi
+        run: npm run check:types
+
+      - name: Deployment configuration unit tests
+        working-directory: rsi
+        run: node --test --test-concurrency=1 test/deployment/deployment.test.ts
+
+      - name: Root Markdown seed inventory and index regression
+        working-directory: rsi
+        run: node --test --test-concurrency=1 test/repository-docs.test.ts test/acceptance/review2-markdown-seed.test.ts
+
+      - name: Production entrypoint fixture and wiring tests
+        working-directory: rsi
+        run: node --test --test-concurrency=1 test/deployment/production-entrypoint.test.ts test/deployment/linux-target-config.test.ts
+
+      - name: Record kernel, namespace and Docker prerequisites
+        run: |
+          set -euo pipefail
+          uname -a
+          node --version
+          docker version
+          docker info --format '{{json .ServerVersion}}'
+          for f in \
+            /proc/sys/fs/protected_hardlinks \
+            /proc/sys/fs/protected_symlinks \
+            /proc/sys/kernel/unprivileged_userns_clone \
+            /proc/sys/user/max_user_namespaces \
+            /proc/sys/kernel/apparmor_restrict_unprivileged_userns; do
+            if [ -r "$f" ]; then printf '%s=' "$f"; cat "$f"; fi
+          done
+          test "$(cat /proc/sys/fs/protected_hardlinks)" = 1
+          test "$(cat /proc/sys/fs/protected_symlinks)" = 1
+
+      - name: Validate compose syntax without starting production
+        run: |
+          set -euo pipefail
+          test ! -e rsi/.env
+          prompt="$RUNNER_TEMP/rsi-ci-prompt-fixture.txt"
+          printf 'CI TARGET FIXTURE ONLY; not a production Agent prompt.\n' > "$prompt"
+          trap 'rm -f rsi/.env "$prompt"' EXIT
+          printf 'RSI_SYSTEM_PROMPT_FILE=%s\nTZ=UTC\nRSI_TIME_ZONE=UTC\nRSI_WORKER_UID=10002\nRSI_WORKER_GID=10002\n' "$prompt" > rsi/.env
+          docker compose --project-directory rsi -f rsi/compose.yaml config >/dev/null
+
+      - name: Build real Linux target image
+        run: docker build --file rsi/Dockerfile --tag rsi-agent:ci .
+
+      - name: Verify image bubblewrap version and --seccomp
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint bwrap rsi-agent:ci --version
+          docker run --rm --entrypoint sh rsi-agent:ci -c "bwrap --help 2>&1 | grep -- --seccomp"
+
+      - name: Bounded real-bwrap target acceptance (no real provider)
+        working-directory: .
+        env:
+          RSI_TARGET_MODE: docker
+          RSI_VALIDATION_IMAGE: rsi-agent:ci
+        run: |
+          set -euo pipefail
+          node rsi/scripts/linux-validation.mjs \
+            --mode docker \
+            --suite target \
+            --image rsi-agent:ci \
+            --no-build \
+            --timeout-ms 1800000 \
+            --report "$RUNNER_TEMP/linux-validation-report.json" \
+            2>&1 | tee "$RUNNER_TEMP/linux-validation.log"
+
+      - name: Bounded real container-entrypoint production smoke
+        working-directory: .
+        env:
+          RSI_TARGET_MODE: docker
+          RSI_VALIDATION_IMAGE: rsi-agent:ci
+        run: |
+          set -euo pipefail
+          node rsi/scripts/linux-validation.mjs \
+            --mode docker \
+            --suite entrypoint \
+            --image rsi-agent:ci \
+            --no-build \
+            --timeout-ms 900000 \
+            --report "$RUNNER_TEMP/production-entrypoint-report.json" \
+            2>&1 | tee "$RUNNER_TEMP/production-entrypoint.log"
+
+      - name: Upload target validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsi-linux-validation-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/linux-validation-report.json
+            ${{ runner.temp }}/linux-validation.log
+            ${{ runner.temp }}/production-entrypoint-report.json
+            ${{ runner.temp }}/production-entrypoint.log
+          retention-days: 14
+
+# This workflow intentionally never runs the optional 24-hour soak. That is an
+# explicit target-machine command (`node rsi/scripts/linux-soak.mjs --hours 24`)
+# and must not be claimed from a push CI run or a syntax-only check.

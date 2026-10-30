@@ -1,0 +1,14 @@
+# LOCAL WINDOWS RUN ONLY. Not part of the deployment contract.
+# Docker Desktop exposes every Windows bind mount as mode 0777, which the
+# project rejects as world-writable. The prompt therefore lives in a Docker
+# volume (build it with the commands in the run notes) instead of a host bind
+# mount. Everything else (cap_drop, seccomp, no privileged) is unchanged.
+services:
+  rsi:
+    volumes: !override
+      - rsi-data:/data
+      - rsi-state:/state
+      - rsi-prompt:/run/config:ro
+
+volumes:
+  rsi-prompt:

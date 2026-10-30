@@ -1,0 +1,257 @@
+SUPERSEDED NOTES: the final integration entry is rsi/src/main.ts; the Supervisor runs as
+container root and uses setpriv so bwrap starts as the distinct non-root Worker uid. See
+rsi/reports/integration.txt and markdowns/operations.md for the current verified behavior.
+The older uid/capability paragraphs below are retained only as historical implementation notes.
+
+RSI-AGENT DEPLOYMENT HANDOFF (plain text, not a prompt)
+Generated: 2026-10-27
+Host used for local validation: MINGW64_NT (Windows), Node 24.16.0, npm 11.13.0
+Docker client: 29.9.2; daemon NOT running (npipe:////./pipe/docker_engine missing)
+Target: Linux Docker, Node >=22.19, bubblewrap, real published Pi SDK/CLI
+
+STATUS AND SCOPE
+- Added the deployment layer only: Dockerfile, rsi/compose.yaml, root .dockerignore,
+  install/entrypoint/run/health/log/control scripts, deployment config samples, deployment
+  report, root operations/security documentation, and deployment tests.
+- rsi/package.json, rsi/package-lock.json, rsi/src/shared/**, all other rsi/src modules,
+  pi/**, markdowns/index.md and markdowns/Memory.md were not modified. No commit was created.
+- No Agent system prompt, Memory content, workflow, or task-solving prompt was generated.
+  The manual prompt remains an operator-supplied external read-only .txt.
+- Worker/Supervisor/preflight/broker/control modules are still owned by the integration work.
+  This layer does not depend on their as-yet-uninherited source. The container entry fails
+  clearly if the integration entry is absent.
+
+EXACT FILE LAYOUT
+- rsi/Dockerfile
+- rsi/compose.yaml
+- .dockerignore (repository root, because the build context is the repository root)
+- rsi/deploy/seccomp-bwrap.json
+- rsi/deploy/rsi.config.template.json
+- rsi/deploy/rsi.config.example.json
+- rsi/deploy/rsi.env.example
+- rsi/deploy/compose.auth.yaml
+- rsi/scripts/install-plugins.mjs / install-plugins.sh
+- rsi/scripts/container-entrypoint.sh
+- rsi/scripts/container-run.mjs
+- rsi/scripts/container-healthcheck.mjs
+- rsi/scripts/container-control.mjs / container-control.sh
+- rsi/scripts/deployment-render-config.mjs
+- rsi/scripts/deployment-preflight.mjs
+- rsi/scripts/deployment-log-rotate.mjs
+- rsi/test/deployment/deployment.test.ts
+- rsi/reports/deployment.txt
+- markdowns/operations.md (996 words), markdowns/security.md (1000 words)
+
+CONTAINER PATH LAYOUT
+- /opt/rsi                       read-only published RSI/Pi runtime and node_modules
+- /opt/rsi/pi-agent-base         immutable, verified Pi agent home from actual pi install
+- /opt/rsi/src/main.ts Supervisor entry (override RSI_SUPERVISOR_ENTRY)
+- /data                          persistent Agent data volume
+- /data/workspace                broad writable task workspace
+- /data/markdowns                broker-managed Memory/index/*.md; Worker read-only
+- /data/pi-agent                 writable Pi home for later user plugins/MCP/Skill/auth
+- /data/pi-sessions              writable Pi sessions
+- /data/worker-home              writable Worker home
+- /data/tools, /data/workflows   writable persistent reusable-tool/workflow directories
+- /state                         persistent protected state volume (not visible to Worker)
+- /state/snapshots               LKG/snapshot backing area
+- /state/plugins/candidates      immutable candidate generations
+- /state/plugins/lkg             promoted last-known-good generations
+- /state/read-stats              24-hour read statistics
+- /state/control                 trusted operator control socket directory
+- /state/logs                    bounded rotated logs
+- /state/runtime                 rendered config and health.json
+- /state/sleep.json, /state/watchdog.json  external sleep/Watchdog state
+- /run/config/system-prompt.txt  read-only bind of the operator's external .txt prompt
+- /state/run/worker.sock         Supervisor/Worker Unix IPC; exported to Worker at /run/rsi/worker.sock
+
+START COMMANDS
+  cd rsi
+  cp deploy/rsi.env.example .env
+  # edit .env: RSI_SYSTEM_PROMPT_FILE, TZ/RSI_TIME_ZONE, RSI_MODEL, RSI_PROVIDER,
+  # RSI_THINKING_LEVEL, RSI_WORKER_UID/GID. Prepare the external non-empty .txt prompt.
+  docker compose build
+  docker compose up -d
+  docker compose ps
+  docker compose logs -f --tail=100 rsi
+
+OAuth/auth.json option:
+  mkdir -p secrets
+  cp /secure/path/auth.json secrets/pi-auth.json
+  docker compose -f compose.yaml -f deploy/compose.auth.yaml up -d
+The entrypoint copies the read-only secret into /data/pi-agent/auth.json only when that file
+does not already exist, mode 0660 with the Worker group (the Worker may refresh OAuth), and
+never prints it.
+
+Direct build equivalent from the repository root:
+  docker build -f rsi/Dockerfile -t rsi-agent:local .
+The Compose build context is ".." and dockerfile is "rsi/Dockerfile".
+
+PINNED PI PLUGINS (ACTUAL COMMANDS, NOT DOCUMENTATION-ONLY)
+- Docker build runs rsi/scripts/install-plugins.mjs, which invokes the real published Pi CLI:
+    pi install npm:pi-continuity@0.3.1
+    pi install npm:pi-better-web-search@0.1.5
+  The explicit @version pins preserve the user-requested npm operations while making them
+  reproducible. No same-named GitHub project and no custom replacement is used.
+- PI_CODING_AGENT_DIR is /opt/rsi/pi-agent-base during build. npm lifecycle scripts are
+  disabled through npm_config_ignore_scripts=true / NPM_CONFIG_IGNORE_SCRIPTS=true. The image
+  project dependencies use npm ci --ignore-scripts; no version lock is disabled.
+- After both installs, the script verifies:
+  * settings.json declares both exact npm specs;
+  * installed names/versions are pi-continuity 0.3.1 and pi-better-web-search 0.1.5;
+  * each package declares and contains ./extensions/index.ts;
+  * installed file trees byte-match the lock-verified rsi/node_modules packages;
+  * Pi's DefaultResourceLoader actually discovers and loads exactly those two extensions.
+- The base home is then chmod -R a-w. It is the immutable baseline. Candidates and LKG belong
+  under /state/plugins/{candidates,lkg}, not under the mutable /data/pi-agent.
+- Local proof: install-plugins.mjs completed both real pi install commands into a temporary
+  agent home and reported "verified Pi discovery loaded 2 extensions". The existing
+  npm run check:plugins also loaded both pinned extensions. No model call was made.
+- Recorded lock identities remain:
+  pi-continuity 0.3.1 sha512-bd7IB76n6XvMfYmYS+IaD9crjPqgTCujQmVdlEjiHatOAnUPwsDUZzrAXIBXdM1kNMQyb16giPE2CrGc9cZxlg==
+  pi-better-web-search 0.1.5 sha512-DmIiyZ4W73wKahVLslMeU29YrpmaXYzP2t4iJ1Fx99ycuDjw2hU372E61feLjOU7tgSzhYSEicDHTvgjjxCLvg==
+
+DOCKER / BWRAP POLICY IMPLEMENTED
+- Supervisor runs as container root only to call setpriv for the distinct Worker uid/gid 10002.
+- cap_drop: ALL plus cap_add SETUID/SETGID/CHOWN for the uid switch and volume repair; no privileged,
+  no docker.sock, no host root mount, no published TCP ports, no control API on the network. Compose uses init: true, restart: unless-stopped,
+  stop_grace_period 30s, and named volumes rsi-data (/data) and rsi-state (/state).
+- The container root filesystem is not made read-only and network egress is not disabled.
+- /state/run is setgid group 10002; container-run.mjs continuously tightens a real worker.sock
+  to 0660 with the Worker group so the distinct-uid Worker can connect immediately.
+- Worker protection is the bwrap policy plus the actual preflight probe, not a relaxed container.
+  The probe runs bwrap with user/PID/IPC/UTS namespaces, isolated /proc, --cap-drop ALL,
+  --new-session, --die-with-parent, the configured Worker uid/gid, then requires uid match
+  and CapEff=0. Failure exits; there is no unsandboxed fallback.
+- rsi/deploy/seccomp-bwrap.json is derived from Moby's default seccomp profile and prepends only
+  the namespace/mount syscalls bubblewrap needs (clone, clone3, unshare, mount, umount,
+  umount2, pivot_root, move_mount, open_tree, fsopen, fsconfig, fsmount, mount_setattr).
+  It grants no capabilities.
+- Outer no-new-privileges is deliberately not set because setpriv must switch to the distinct
+  Worker uid. bwrap sets no-new-privileges and drops all capabilities for the Worker itself.
+  Hosts that require an AppArmor exception need an explicit host policy; docs do not recommend
+  disabling the sandbox. Startup diagnostics distinguish seccomp/userns, mount/proc, and uid-map
+  failures and print CapEff and userns sysctls.
+
+HEALTHCHECK CONTRACT FOR INTEGRATION
+- Command: node /opt/rsi/scripts/container-healthcheck.mjs
+- File: /state/runtime/health.json, written atomically by the Supervisor at least every
+  10 seconds (including during sleep). Health is stale after RSI_HEALTH_MAX_AGE_MS, default
+  45000 ms. Required shape:
+    {
+      "version": 1,
+      "updatedAtMs": <epoch ms>,
+      "supervisor": { "pid": <pid>, "state": "running" },
+      "worker": { "pid": <pid|null>, "state": "healthy|sleeping|starting|restarting|stopped|failed",
+                  "generation": <number|null> },
+      "sleep": { "active": <bool>, "deadlineMs": <epoch ms|null> },
+      "plugin": { "generation": <number|null>, "healthTurns": <number>,
+                  "lkgGeneration": <number|null> },   // optional
+      "watchdog": { "phase": "idle|healthy|suspect|rollback" } // optional
+    }
+- Healthy requires: supervisor pid alive and state running; worker healthy with live pid, or
+  sleeping with sleep.active=true and a future deadline; watchdog not suspect/rollback.
+  Sleeping is healthy. Starting/restarting/stopped/failed are unhealthy. PID liveness is real
+  (kill(pid,0)); the file is not trusted alone. Docker uses 30s interval, 10s timeout, 3 retries,
+  120s start period.
+- The status command prints the same file; no health result is inferred from logs.
+
+OPERATOR CONTROL CONTRACT FOR INTEGRATION
+- Socket: /state/control/operator.sock (override RSI_CONTROL_SOCKET), trusted Supervisor only.
+- One LF-delimited JSON request: {"version":1,"id":"<uuid>","command":"reload|shutdown|cancelSleep",
+  "candidateId":"...","reason":"..."}; one LF-delimited response:
+  {"version":1,"id":"<same>","ok":true,"detail":"..."} or ok:false with error.
+- rsi/scripts/container-control.mjs implements the client and clear ENOENT diagnostics. The
+  integration must implement the server. status reads health.json, not the socket.
+- Reload remains: immutable candidate digest -> static TS check -> 3s Mock load -> load ->
+  exactly 3 consecutive healthy agent_settled runs -> external LKG. Any crash/hang/missed
+  heartbeat/health failure restores LKG. Verification must be repeated after load; digest
+  mismatch or fewer than 3 turns cannot promote.
+
+LOGGING / SIGNALS / RESTART CONTRACT
+- container-run.mjs starts the actual integration entry, forwards SIGTERM/SIGINT to the
+  Supervisor process group, and after a 20s grace sends SIGKILL to the process group and /proc
+  descendants. Compose init handles PID 1 reaping. Unexpected Supervisor exit exits non-zero,
+  allowing restart policy handling.
+- Integration must write logs as append-only files under /state/logs. The wrapper copy-truncates
+  *.log every 30s at 16 MiB, keeping 4 files; Docker json-file is capped at 10 MiB x 3.
+  This is bounded against unbounded crash-loop disk growth.
+
+CONFIG / MODEL / PROMPT
+- Rendered config path: /state/runtime/rsi.config.json (RSI_CONFIG_PATH), from
+  deploy/rsi.config.template.json. Paths are fixed container paths; TZ and worker uid/gid are
+  rendered from env and then validated by shared loadRsiConfigFile + verifyRuntimeLayout.
+- Operator env: TZ, RSI_TIME_ZONE, RSI_MODEL, RSI_PROVIDER, RSI_THINKING_LEVEL,
+  RSI_WORKER_UID/GID, RSI_SYSTEM_PROMPT_FILE (host path only), optional RSI_SUPERVISOR_ENTRY.
+  Integration must consume model/provider/thinking env (or Pi settings.json in /data/pi-agent).
+- Missing/empty/symlink/hardlink/non-regular prompt fails closed via shared verification; no
+  example prompt exists. Deployment samples contain no prompt, Memory, or task workflow text.
+- web_search needs a real supported provider credential (for example DEEPSEEK_API_KEY or
+  OLLAMA_API_KEY, or a provider login). Tests made no paid API call.
+
+TESTS RUN AND RESULTS
+- cd rsi && npm ci --ignore-scripts --no-audit --no-fund: success (122 packages).
+- npm run check:types: success.
+- node --test test/deployment/*.test.ts: 9/9 pass.
+  Covered: Docker/Compose/static security constraints; config schema/render/TZ; prompt-missing
+  fail-closed and bwrap-missing fail-closed; health parsing including sleeping/stale/rollback;
+  bounded log rotation; control status + Unix/named-pipe client; real Pi discovery of both pinned
+  extensions from a fixture; Markdown word/doc caps.
+- node scripts/check-plugins.mjs: success, 2 pinned extensions loaded.
+- Real install-plugins.mjs with both pi install commands: success, 2 extensions discovered.
+- docker compose -f compose.yaml config: success with a temporary .env and prompt path; auth
+  override also merged successfully.
+- Full npm test: 51/52 pass. The only failure is the existing
+  rsi/test/repository-docs.test.ts because markdowns/index.md intentionally does not yet list
+  operations.md and security.md. Integration must add those rows when it updates the index.
+- Docker build was attempted and failed before any build step:
+  "failed to connect to the docker API at npipe:////./pipe/docker_engine".
+  No Docker image build, Linux bwrap startup, namespace mount, seccomp enforcement, AppArmor,
+  newuidmap/subuid, or 24-hour soak is claimed as verified.
+
+KERNEL / CAPS / SECCOMP: VERIFIED VS NOT VERIFIED
+- Verified locally: config/time-zone/path validation; prompt fail-closed; health file logic;
+  log rotation; control client framing; plugin install commands and Pi resource discovery;
+  static no-privileged/no-docker.sock/cap-drop-ALL/ports/logging/volume/restart settings.
+- Not verified locally: kernel unprivileged userns, actual bwrap ro-bind/hidden-state/mount
+  behavior, seccomp profile acceptance by a particular Docker/libseccomp version, AppArmor,
+  setuid newuidmap mapping, CapEff=0 inside the real Worker, pid/namespace isolation, ptrace
+  denial, 3-turn/LKG rollback, sleep across restart, 24h operation.
+- Required host conditions: Linux with unprivileged user namespaces
+  (user.max_user_namespaces > 0; distro-specific unprivileged_userns_clone), Docker seccomp
+  profile control, fs.protected_hardlinks=1, fs.protected_symlinks=1, subuid/subgid for the
+  Worker, an AppArmor policy that permits bwrap on AppArmor hosts, and, only if the host
+  runtime masks /proc in a way that blocks a fresh procfs mount, the explicit host-runtime
+  systempaths option. These are prerequisites, not silent fallbacks.
+- Security claims are limited accordingly. Container root is not advertised as Docker host root.
+  Broad writable disk/network remains by design; only Runtime/Pi/prompt/managed Markdown and
+  protected state are constrained.
+
+INTEGRATION CHECKLIST (REQUIRED BEFORE CALLING DEPLOYMENT COMPLETE)
+1. Provide /opt/rsi/src/main.ts (or set RSI_SUPERVISOR_ENTRY). It must load
+   RSI_CONFIG_PATH, consume model/provider/thinking env or Pi settings, and construct the Worker
+   with pluginExtensionPaths from REQUIRED_PLUGIN_PINS in /opt/rsi/node_modules.
+2. Implement the real bwrap launcher using shared createSandboxPolicy plus actual --cap-drop ALL,
+   no-new-privileges, ro binds, hidden state, isolated proc and the distinct Worker uid/gid.
+3. Write /state/runtime/health.json atomically with real pid/state data, including sleep.
+4. Expose the trusted /state/control/operator.sock server for reload/shutdown/cancelSleep and
+   keep it off TCP. Use candidate/LKG directories under /state/plugins.
+5. Ensure integration logs are append-only under /state/logs or otherwise reopen/rotate safely;
+   broker-created managed Markdown must stay Worker-readable (0644/0664 or Worker group).
+6. Keep the two pinned plugins and three-healthy-turn promotion; do not silently update versions
+   or disable locks.
+7. Update markdowns/index.md with operations.md and security.md rows, then rerun full checks.
+8. On a real Linux Docker host, build the image, run the bwrap preflight, verify CapEff=0 and
+   ro/hidden mounts, then repeat health/sleep/restart and reload rollback checks.
+
+DEPENDENCY DIFFERENCES / UNKNOWNS
+- No npm dependency was added. Existing exact pins: Pi SDK 1.4.0, pi-continuity 0.3.1,
+  pi-better-web-search 0.1.5, typebox 1.3.27, TypeScript 5.9.3, @types/node 22.19.19.
+- Docker adds OS packages bubblewrap, uidmap, tzdata, procps and ca-certificates, plus Node
+  22.19.0 bookworm-slim. The local validation Node is 24.16; Node 22.19 native TypeScript
+  stripping is the runtime assumption for the integration .ts entry.
+- pi install creates a second copy of the two plugin packages under
+  /opt/rsi/pi-agent-base/npm/node_modules. It is verified byte-identical to the npm-ci locked
+  copies; this duplication is intentional so Pi discovery and the shared pinned path both work.
+- The seccomp profile is based on the Moby default at implementation time, not on the target
+  host's Docker version; profile loading and AppArmor interaction must be validated on the host.

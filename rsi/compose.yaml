@@ -1,0 +1,70 @@
+name: rsi-agent
+
+services:
+  rsi:
+    build:
+      context: ..
+      dockerfile: rsi/Dockerfile
+    image: rsi-agent:local
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    pids_limit: 512
+    ulimits:
+      core: 0
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-UTC}
+      RSI_TIME_ZONE: ${RSI_TIME_ZONE:-UTC}
+      RSI_WORKER_UID: ${RSI_WORKER_UID:-10002}
+      RSI_WORKER_GID: ${RSI_WORKER_GID:-10002}
+      RSI_SUPERVISOR_ENTRY: ${RSI_SUPERVISOR_ENTRY:-/opt/rsi/src/main.ts}
+      RSI_MODEL: ${RSI_MODEL:-cline-pass/deepseek-v4.1-flash}
+      RSI_PROVIDER: ${RSI_PROVIDER:-cline}
+      RSI_THINKING_LEVEL: ${RSI_THINKING_LEVEL:-high}
+      PI_CODING_AGENT_DIR: /data/pi-agent
+      PI_BASE_AGENT_DIR: /opt/rsi/pi-agent-base
+      RSI_PI_REAL_CLI: /opt/rsi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js
+      NPM_CONFIG_IGNORE_SCRIPTS: "true"
+    volumes:
+      - rsi-data:/data
+      - rsi-state:/state
+      - type: bind
+        source: ${RSI_SYSTEM_PROMPT_FILE:?set RSI_SYSTEM_PROMPT_FILE in rsi/.env}
+        target: /run/config/system-prompt.txt
+        read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    group_add:
+      - "10002"
+    # The target validation runner in rsi/scripts/linux-target-docker.mjs uses
+    # this same cap-drop/seccomp contract, without extra host privilege or a
+    # container-runtime socket mount. The outer container deliberately does not
+    # set no-new-privileges because setpriv must switch from the Supervisor to
+    # the distinct Worker UID; bwrap sets it for the Worker itself. A missing
+    # namespace/userns/seccomp/AppArmor prerequisite fails startup validation
+    # and target acceptance, never skips green.
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - CHOWN
+    security_opt:
+      - seccomp=./deploy/seccomp-bwrap.json
+    healthcheck:
+      test: ["CMD", "node", "/opt/rsi/scripts/container-healthcheck.mjs"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  rsi-data:
+  rsi-state:

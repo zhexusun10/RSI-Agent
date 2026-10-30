@@ -1,0 +1,4 @@
+services:
+  rsi:
+    volumes:
+      - ./secrets/pi-auth.json:/run/secrets/pi-auth.json:ro
