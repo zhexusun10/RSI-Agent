@@ -552,7 +552,8 @@ export async function createSandboxPlan(
 	for (const root of protectedRoots) {
 		for (const target of findMountAliasTargets([root], mountInfo)) {
 			if (target === root || protectedRoots.includes(target)) continue;
-			appendMount(readOnlyMounts, root, target, "ro", "protected-alias");
+			const source = isPosixWithin(root, target) ? target : root;
+			appendMount(readOnlyMounts, source, target, "ro", "protected-alias");
 		}
 	}
 	// Preserve the policy's configured target aliases as well.
