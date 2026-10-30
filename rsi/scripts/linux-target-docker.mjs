@@ -272,6 +272,8 @@ export function dockerRunArgs({
 		"CHOWN",
 		"--security-opt",
 		`seccomp=${seccompPath}`,
+		"--security-opt",
+		"apparmor=unconfined",
 		"--tmpfs",
 		"/tmp:rw,size=256m,mode=1777",
 		"--mount",

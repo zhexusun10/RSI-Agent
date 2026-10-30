@@ -53,6 +53,7 @@ services:
       - CHOWN
     security_opt:
       - seccomp=./deploy/seccomp-bwrap.json
+      - apparmor=unconfined
     healthcheck:
       test: ["CMD", "node", "/opt/rsi/scripts/container-healthcheck.mjs"]
       interval: 30s

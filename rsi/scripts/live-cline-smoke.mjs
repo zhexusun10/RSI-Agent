@@ -42,7 +42,7 @@ try {
 	for (const volume of volumes) docker(["volume", "create", volume]);
 	docker(["run", "--rm", "--network", "none", "--entrypoint", "node", "--mount", `type=volume,source=${volumes[0]},target=/run/config`, image, "-e", `require('fs').writeFileSync('/run/config/system-prompt.txt',${JSON.stringify(prompt)},{mode:0o644})`]);
 	const seccomp = resolve(root, "deploy/seccomp-bwrap.json");
-	docker(["run", "-d", "--name", container, "--init", "--pids-limit", "512", "--cap-drop", "ALL", "--cap-add", "SETUID", "--cap-add", "SETGID", "--cap-add", "CHOWN", "--security-opt", `seccomp=${seccomp}`, "--mount", `type=volume,source=${volumes[0]},target=/run/config,readonly`, "--mount", `type=volume,source=${volumes[1]},target=/data,volume-nocopy`, "--mount", `type=volume,source=${volumes[2]},target=/state,volume-nocopy`, "-e", "CLINE_API_KEY", "-e", "RSI_PROVIDER=cline", "-e", "RSI_MODEL=cline-pass/deepseek-v4.1-flash", "-e", "RSI_THINKING_LEVEL=high", image]);
+	docker(["run", "-d", "--name", container, "--init", "--pids-limit", "512", "--cap-drop", "ALL", "--cap-add", "SETUID", "--cap-add", "SETGID", "--cap-add", "CHOWN", "--security-opt", `seccomp=${seccomp}`, "--security-opt", "apparmor=unconfined", "--mount", `type=volume,source=${volumes[0]},target=/run/config,readonly`, "--mount", `type=volume,source=${volumes[1]},target=/data,volume-nocopy`, "--mount", `type=volume,source=${volumes[2]},target=/state,volume-nocopy`, "-e", "CLINE_API_KEY", "-e", "RSI_PROVIDER=cline", "-e", "RSI_MODEL=cline-pass/deepseek-v4.1-flash", "-e", "RSI_THINKING_LEVEL=high", image]);
 	started = true;
 	const deadline = Date.now() + timeoutMs;
 	let last = {};
