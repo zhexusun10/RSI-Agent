@@ -65,6 +65,9 @@ jobs:
           node --version
           docker version
           docker info --format '{{json .ServerVersion}}'
+          if [ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          fi
           for f in \
             /proc/sys/fs/protected_hardlinks \
             /proc/sys/fs/protected_symlinks \
